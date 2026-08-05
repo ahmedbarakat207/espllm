@@ -299,4 +299,4 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     load_model()
     while True:
-        generate_reply(20)
+        generate_reply(70)
