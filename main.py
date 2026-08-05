@@ -1,8 +1,8 @@
 import math, torch, torch.nn as nn
-from tabnanny import check
 from torch.nn import functional as F
-import torch.quantization
 import os.path
+import gzip
+import copy
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import os
 
@@ -13,21 +13,21 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 checkpoint   = "./model/model.pt"
-block_size   = 64
+block_size   = 128 # best 128
 batch_size   = 32
 n_layer      = 2
 n_head       = 4
 n_embd       = 128
 dropout      = 0.3
-max_iters    = 10000
+max_iters    = 20000
 eval_interval= 200
 lr           = 3e-3 
 eval_iters   = 200
 generate_tokens = 400 
-tempreature  = 0.9      
+tempreature  = 0.7     
 start_iter   = 0     
-patience     = 5
-use_quantized = True 
+patience     = 15
+use_quantized = True
 torch.manual_seed(1337)  
 
 dataset = open("dataset.txt", "r+")
@@ -70,7 +70,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
         self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
-                             .view(1,1,block_size,block_size))
+                             .view(1,1,block_size,block_size), persistent=False)
 
     def forward(self, x):
         B, T, C = x.size()
@@ -122,8 +122,8 @@ class Transformer(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        tok = self.tok_emb(idx)
-        pos = self.pos_emb(torch.arange(T, device=idx.device))
+        tok = self.tok_emb(idx).float()
+        pos = self.pos_emb(torch.arange(T, device=idx.device)).float()
         x = self.drop(tok + pos)
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -159,10 +159,71 @@ def estimate_loss():
     model.train()
     return out
 
-def quantize_model(model, quantization):
+def _int4_pack(q):
+    out, n = q.shape
+    if n % 2:
+        q = F.pad(q, (0, 1))
+        n += 1
+    lo = q[:, 0::2] & 0x0F
+    hi = (q[:, 1::2] << 4) & 0xF0
+    return (lo | hi).to(torch.uint8)
+
+class Int4Linear(nn.Module):
+    def __init__(self, in_features, out_features, weight, bias=None, group_size=64):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        qweight, scale, zero_point = self._quantize(weight.detach())
+        self.register_buffer("qweight", qweight)
+        self.register_buffer("scale", scale.half())
+        self.register_buffer("zero_point", zero_point.half())
+        if bias is not None:
+            self.bias = nn.Parameter(bias.detach().half())
+        else:
+            self.register_parameter("bias", None)
+
+    def _quantize(self, w):
+        out, n = w.shape
+        n_groups = math.ceil(n / self.group_size)
+        if n_groups * self.group_size != n:
+            w = F.pad(w, (0, n_groups * self.group_size - n))
+        w = w.view(out, n_groups, self.group_size)
+        wmin = w.min(dim=-1, keepdim=True).values
+        wmax = w.max(dim=-1, keepdim=True).values
+        scale = (wmax - wmin) / 15.0
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        zp = torch.round(-wmin / scale)
+        q = torch.clamp(torch.round(w / scale) + zp, 0, 15).to(torch.uint8)
+        q = q.view(out, n_groups * self.group_size)[:, :n]
+        return _int4_pack(q), scale.squeeze(-1), zp.squeeze(-1)
+
+    def _dequantize_weight(self):
+        m = self.qweight.shape[1]
+        q = torch.empty(self.out_features, m * 2, dtype=torch.uint8, device=self.qweight.device)
+        q[:, 0::2] = self.qweight & 0x0F
+        q[:, 1::2] = (self.qweight >> 4) & 0x0F
+        q = q[:, :self.in_features].float()
+        groups = torch.arange(self.in_features, device=q.device) // self.group_size
+        return (q - self.zero_point.float()[:, groups]) * self.scale.float()[:, groups]
+
+    def forward(self, x):
+        bias = self.bias.float() if self.bias is not None else None
+        return F.linear(x, self._dequantize_weight(), bias)
+
+def quantize_model(model, group_size=64):
     model.eval()
-    quantized = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=quantization)
-    return quantized
+    for name, child in model.named_children():
+        if isinstance(child, nn.Linear):
+            bias = child.bias.detach() if child.bias is not None else None
+            setattr(model, name, Int4Linear(child.in_features, child.out_features,
+                                           child.weight.detach(), bias, group_size))
+        else:
+            quantize_model(child, group_size)
+    for name, child in model.named_modules():
+        if isinstance(child, nn.Embedding):
+            child.weight.data = child.weight.data.half()
+    return model
     
 def train():
     best_val_loss = float('inf')
@@ -190,36 +251,32 @@ def train():
         optimizer.step()
     torch.save(model.state_dict(), checkpoint)
     print("Unquantized model saved to", checkpoint)
-    torch.backends.quantized.engine = 'qnnpack'
-    quantized_model = quantize_model(model, torch.qint8)
-    torch.save(quantized_model, checkpoint + ".quantized")   # save full object
+    quantized_model = quantize_model(copy.deepcopy(model))
+    with gzip.open(checkpoint + ".quantized", "wb") as f:
+        torch.save(quantized_model, f)   # save full object, gzip-compressed
     quant_size = os.path.getsize(checkpoint + ".quantized")
-    print("Quantized model saved to", checkpoint + ".quantized", "Size:", quant_size / (1024*1024), "MB")
+    print("Quantized model saved to", checkpoint + ".quantized", "Size:", quant_size / 1024, "KB")
 
-model = Transformer().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-
-if (os.path.isfile(checkpoint)):
+def load_model():
+    global model
     if use_quantized and os.path.isfile(checkpoint + ".quantized"):
         print("Loading quantized model...")
-        model = torch.load(checkpoint + ".quantized", map_location=device)
+        with gzip.open(checkpoint + ".quantized", "rb") as f:
+            model = torch.load(f, map_location=device, weights_only=False)
         model.to(device)
         model.eval()
+        return
+    model = Transformer().to(device)
+    if os.path.isfile(checkpoint + ".best"):
+        model.load_state_dict(torch.load(checkpoint + ".best", map_location=device))
+        print("Loaded best unquantized model.")
+    elif os.path.isfile(checkpoint):
+        model.load_state_dict(torch.load(checkpoint, map_location=device))
+        print("Loaded unquantized model.")
     else:
-        model = Transformer().to(device)
-        if os.path.isfile(checkpoint + ".best"):
-            model.load_state_dict(torch.load(checkpoint + ".best", map_location=device))
-            print("Loaded best unquantized model.")
-        elif os.path.isfile(checkpoint):
-            model.load_state_dict(torch.load(checkpoint, map_location=device))
-            print("Loaded unquantized model.")
-        else:
-            print("No checkpoint found. Training from scratch...")
-            train()
-            model.load_state_dict(torch.load(checkpoint))
-else:
-    print("No Checkpoint Found, Training the Model")
-    train()
+        print("No checkpoint found. Training from scratch...")
+        train()
+        model.load_state_dict(torch.load(checkpoint))
 
 def generate_reply(max_token_length):
     user_input = input("User: ")
@@ -237,5 +294,9 @@ def generate_reply(max_token_length):
     else:
         print(full_response) 
 
-while True:
-    generate_reply(20)
+if __name__ == "__main__":
+    model = Transformer().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    load_model()
+    while True:
+        generate_reply(20)
