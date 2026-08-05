@@ -3,6 +3,8 @@ from tabnanny import check
 from torch.nn import functional as F
 import torch.quantization
 import os.path
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import os
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -11,21 +13,21 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 checkpoint   = "./model/model.pt"
-block_size   = 128
+block_size   = 64
 batch_size   = 32
-n_layer      = 4
+n_layer      = 2
 n_head       = 4
-n_embd       = 256 
-dropout      = 0.1
-max_iters    = 2000
+n_embd       = 128
+dropout      = 0.3
+max_iters    = 10000
 eval_interval= 200
 lr           = 3e-3 
 eval_iters   = 200
 generate_tokens = 400 
-tempreature  = 0.7      
+tempreature  = 0.9      
 start_iter   = 0     
 patience     = 5
-
+use_quantized = True 
 torch.manual_seed(1337)  
 
 dataset = open("dataset.txt", "r+")
@@ -178,25 +180,43 @@ def train():
                 if patience_counter >= patience:
                     print("Early stopping.")
                     break
-    
+
         xb, yb = get_batch("train")
         logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=1000, T_mult=2)
         optimizer.step()
+    torch.save(model.state_dict(), checkpoint)
+    print("Unquantized model saved to", checkpoint)
     torch.backends.quantized.engine = 'qnnpack'
     quantized_model = quantize_model(model, torch.qint8)
-    torch.save(quantized_model.state_dict(), checkpoint)
-    print("Model Trained Successfully, Saved Checkpoint in ../model/model.pt")
+    torch.save(quantized_model, checkpoint + ".quantized")   # save full object
+    quant_size = os.path.getsize(checkpoint + ".quantized")
+    print("Quantized model saved to", checkpoint + ".quantized", "Size:", quant_size / (1024*1024), "MB")
 
 model = Transformer().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
 if (os.path.isfile(checkpoint)):
-    print("Checkpoint Found, Starting the model")
-    checkpoint_load = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(checkpoint_load)
+    if use_quantized and os.path.isfile(checkpoint + ".quantized"):
+        print("Loading quantized model...")
+        model = torch.load(checkpoint + ".quantized", map_location=device)
+        model.to(device)
+        model.eval()
+    else:
+        model = Transformer().to(device)
+        if os.path.isfile(checkpoint + ".best"):
+            model.load_state_dict(torch.load(checkpoint + ".best", map_location=device))
+            print("Loaded best unquantized model.")
+        elif os.path.isfile(checkpoint):
+            model.load_state_dict(torch.load(checkpoint, map_location=device))
+            print("Loaded unquantized model.")
+        else:
+            print("No checkpoint found. Training from scratch...")
+            train()
+            model.load_state_dict(torch.load(checkpoint))
 else:
     print("No Checkpoint Found, Training the Model")
     train()
