@@ -1,165 +1,64 @@
 import math, torch, torch.nn as nn
 from torch.nn import functional as F
-import os.path
-import gzip
-import copy
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-import os
+import os, copy, gzip
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 if torch.cuda.is_available():
     device = "cuda"
-#elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #device = "mps"
 else:
     device = "cpu"
-checkpoint   = "./model/model.pt"
-block_size   = 128 # best 128
-batch_size   = 32
-n_layer      = 2
-n_head       = 4
-n_embd       = 128
-dropout      = 0.3
-max_iters    = 20000
-eval_interval= 200
-lr           = 3e-3 
-eval_iters   = 200
-generate_tokens = 400 
-tempreature  = 0.7     
-start_iter   = 0     
-patience     = 15
-use_quantized = True
-torch.manual_seed(1337)  
+
+checkpoint       = "./model/model.pt"
+block_size       = 128
+batch_size       = 32
+n_layer          = 2
+n_head           = 4
+n_embd           = 128
+dropout          = 0.25      # sweet spot: 0.1 overfit, 0.3 underfit
+max_iters        = 20000
+eval_interval    = 100       # check every 100 iters to catch optimum early
+lr               = 2e-3      # 3e-3 caused fast memorisation
+lr_min           = 1e-5
+warmup_iters     = 300
+eval_iters       = 200
+generate_tokens  = 400
+temperature      = 0.3
+start_iter       = 0
+patience         = 10        # more room since LR now decays faster
+label_smoothing  = 0.0
+qat_group_size   = 64
+
+torch.manual_seed(1337)
 
 dataset = open("dataset.txt", "r+")
-text = dataset.read()
+text    = dataset.read()
 
-chars = sorted(list(set(text)))
-vocab_size = len(chars)                   
-stoi = {ch:i for i,ch in enumerate(chars)} 
-itos = {i:ch for ch,i in stoi.items()} 
-encode = lambda s: torch.tensor([stoi[c] for c in s], dtype=torch.long)
-decode = lambda t: "".join(itos[int(i)] for i in t)
+chars      = sorted(list(set(text)))
+vocab_size = len(chars)
+stoi       = {ch: i for i, ch in enumerate(chars)}
+itos       = {i: ch for ch, i in stoi.items()}
+encode     = lambda s: torch.tensor([stoi[c] for c in s], dtype=torch.long)
+decode     = lambda t: "".join(itos[int(i)] for i in t)
 
-# Prepare train/validation split
 data = encode(text)
-n = int(0.9*len(data))
+n    = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
+
 def get_batch(split):
-    d = train_data if split == "train" else val_data
+    d         = train_data if split == "train" else val_data
     cur_block = min(block_size, max(2, len(d) - 2))
-    hi = len(d) - cur_block - 1
+    hi        = len(d) - cur_block - 1
     if hi <= 0:
         x = d[:cur_block].unsqueeze(0)
         y = d[1:cur_block+1].unsqueeze(0)
         return x.to(device), y.to(device)
-
     ix = torch.randint(hi, (batch_size,))
-    x = torch.stack([d[i:i+cur_block] for i in ix])
-    y = torch.stack([d[i+1:i+cur_block+1] for i in ix])
+    x  = torch.stack([d[i:i+cur_block] for i in ix])
+    y  = torch.stack([d[i+1:i+cur_block+1] for i in ix])
     return x.to(device), y.to(device)
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head, dropout):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.key = nn.Linear(n_embd, n_embd, bias=False)
-        self.query = nn.Linear(n_embd, n_embd, bias=False)
-        self.value = nn.Linear(n_embd, n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
-                             .view(1,1,block_size,block_size), persistent=False)
 
-    def forward(self, x):
-        B, T, C = x.size()
-        k = self.key(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2)
-        q = self.query(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2)
-        v = self.value(x).view(B, T, self.n_head, C//self.n_head).transpose(1,2)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))
-        att = att.masked_fill(self.mask[:,:,:T,:T]==0, float("-inf")) 
-        att = F.softmax(att, dim=-1)                               
-        att = self.attn_drop(att)
-        y = att @ v
-        y = y.transpose(1,2).contiguous().view(B, T, C)
-        y = self.resid_drop(self.proj(y))
-        return y
-
-class MLP(nn.Module):
-    def __init__(self, n_embd, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4*n_embd),
-            nn.GELU(),
-            nn.Linear(4*n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-    def forward(self, x): return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head, dropout):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, dropout)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = MLP(n_embd, dropout)
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x)) 
-        x = x + self.mlp(self.ln2(x))   
-        return x
-
-class Transformer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.head.weight = self.tok_emb.weight
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok = self.tok_emb(idx).float()
-        pos = self.pos_emb(torch.arange(T, device=idx.device)).float()
-        x = self.drop(tok + pos)
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temp = tempreature):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temp
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, next_id), dim=1)
-        return idx
-
-@torch.no_grad()
-def estimate_loss():
-    model.eval()
-    out = {}
-    for split in ["train","val"]:
-        losses = []
-        for _ in range(eval_iters):
-            xb, yb = get_batch(split)
-            _, loss = model(xb, yb)
-            losses.append(loss.item())
-        out[split] = sum(losses)/len(losses)
-    model.train()
-    return out
-
-def _int4_pack(q):
+def _int4_pack(q: torch.Tensor) -> torch.Tensor:
     out, n = q.shape
     if n % 2:
         q = F.pad(q, (0, 1))
@@ -168,78 +67,303 @@ def _int4_pack(q):
     hi = (q[:, 1::2] << 4) & 0xF0
     return (lo | hi).to(torch.uint8)
 
+
+def quantize_tensor_int4(w: torch.Tensor, group_size: int = 64):
+    out, n      = w.shape
+    n_groups    = math.ceil(n / group_size)
+    padded_n    = n_groups * group_size
+    if padded_n != n:
+        w = F.pad(w, (0, padded_n - n))
+    wg   = w.view(out, n_groups, group_size)
+    wmin = wg.min(dim=-1, keepdim=True).values
+    wmax = wg.max(dim=-1, keepdim=True).values
+    scale = (wmax - wmin) / 15.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    zp    = torch.round(-wmin / scale)
+    q     = torch.clamp(torch.round(wg / scale) + zp, 0, 15).to(torch.uint8)
+    q     = q.view(out, padded_n)[:, :n]
+    return _int4_pack(q), scale.squeeze(-1), zp.squeeze(-1)
+
+
+def dequantize_tensor_int4(q_packed: torch.Tensor, scale: torch.Tensor,
+                           zp: torch.Tensor, n: int, group_size: int = 64):
+    m = q_packed.shape[1]
+    q = torch.empty(q_packed.shape[0], m * 2, dtype=torch.uint8, device=q_packed.device)
+    q[:, 0::2] = q_packed & 0x0F
+    q[:, 1::2] = (q_packed >> 4) & 0x0F
+    q = q[:, :n].float()
+    groups = torch.arange(n, device=q.device) // group_size
+    return (q - zp.float()[:, groups]) * scale.float()[:, groups]
+
+
+class QATLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 group_size: int = 64):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.group_size   = group_size
+        self.weight       = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def _fake_quantize(self, w: torch.Tensor) -> torch.Tensor:
+        out, n       = w.shape
+        n_groups     = math.ceil(n / self.group_size)
+        padded_n     = n_groups * self.group_size
+        w_pad        = F.pad(w, (0, padded_n - n)) if padded_n != n else w
+        wg           = w_pad.view(out, n_groups, self.group_size)
+        wmin         = wg.min(dim=-1, keepdim=True).values
+        wmax         = wg.max(dim=-1, keepdim=True).values
+        scale        = (wmax - wmin) / 15.0
+        scale        = torch.where(scale == 0, torch.ones_like(scale), scale)
+        zp           = torch.round(-wmin / scale)
+        q            = torch.clamp(torch.round(wg / scale) + zp, 0, 15)
+        w_deq        = (q - zp) * scale
+        w_deq        = w_deq.view(out, padded_n)[:, :n]
+        return w + (w_deq - w).detach()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            w = self._fake_quantize(self.weight)
+        else:
+            w = self.weight
+        return F.linear(x, w, self.bias)
+
+    def to_int4(self):
+        return Int4Linear(self.in_features, self.out_features,
+                          self.weight.detach(),
+                          self.bias.detach() if self.bias is not None else None,
+                          self.group_size)
+
+
 class Int4Linear(nn.Module):
     def __init__(self, in_features, out_features, weight, bias=None, group_size=64):
         super().__init__()
-        self.in_features = in_features
+        self.in_features  = in_features
         self.out_features = out_features
-        self.group_size = group_size
-        qweight, scale, zero_point = self._quantize(weight.detach())
-        self.register_buffer("qweight", qweight)
-        self.register_buffer("scale", scale.half())
-        self.register_buffer("zero_point", zero_point.half())
+        self.group_size   = group_size
+        q, scale, zp = quantize_tensor_int4(weight.detach(), group_size)
+        self.register_buffer("qweight",    q)
+        self.register_buffer("scale",      scale.half())
+        self.register_buffer("zero_point", zp.half())
         if bias is not None:
             self.bias = nn.Parameter(bias.detach().half())
         else:
             self.register_parameter("bias", None)
 
-    def _quantize(self, w):
-        out, n = w.shape
-        n_groups = math.ceil(n / self.group_size)
-        if n_groups * self.group_size != n:
-            w = F.pad(w, (0, n_groups * self.group_size - n))
-        w = w.view(out, n_groups, self.group_size)
-        wmin = w.min(dim=-1, keepdim=True).values
-        wmax = w.max(dim=-1, keepdim=True).values
-        scale = (wmax - wmin) / 15.0
-        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-        zp = torch.round(-wmin / scale)
-        q = torch.clamp(torch.round(w / scale) + zp, 0, 15).to(torch.uint8)
-        q = q.view(out, n_groups * self.group_size)[:, :n]
-        return _int4_pack(q), scale.squeeze(-1), zp.squeeze(-1)
-
     def _dequantize_weight(self):
-        m = self.qweight.shape[1]
-        q = torch.empty(self.out_features, m * 2, dtype=torch.uint8, device=self.qweight.device)
-        q[:, 0::2] = self.qweight & 0x0F
-        q[:, 1::2] = (self.qweight >> 4) & 0x0F
-        q = q[:, :self.in_features].float()
-        groups = torch.arange(self.in_features, device=q.device) // self.group_size
-        return (q - self.zero_point.float()[:, groups]) * self.scale.float()[:, groups]
+        return dequantize_tensor_int4(
+            self.qweight, self.scale, self.zero_point,
+            self.in_features, self.group_size
+        )
 
     def forward(self, x):
         bias = self.bias.float() if self.bias is not None else None
         return F.linear(x, self._dequantize_weight(), bias)
 
-def quantize_model(model, group_size=64):
+
+def precompute_freqs(head_dim: int, max_seq_len: int, device):
+    theta   = 10000.0 ** (-torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    t       = torch.arange(max_seq_len, device=device).float()
+    freqs   = torch.outer(t, theta)
+    return freqs.cos(), freqs.sin()
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    B, H, T, D = x.shape
+    cos = cos[:T].unsqueeze(0).unsqueeze(0)
+    sin = sin[:T].unsqueeze(0).unsqueeze(0)
+    return torch.cat([x1 * cos - x2 * sin,
+                      x1 * sin + x2 * cos], dim=-1)
+
+
+class SwiGLUMLP(nn.Module):
+    def __init__(self, n_embd: int, dropout: float, group_size: int = 64):
+        super().__init__()
+        hidden = int(2 / 3 * 4 * n_embd)
+        hidden = ((hidden + 3) // 4) * 4
+        self.gate_proj = QATLinear(n_embd, hidden, bias=False, group_size=group_size)
+        self.up_proj   = QATLinear(n_embd, hidden, bias=False, group_size=group_size)
+        self.down_proj = QATLinear(hidden, n_embd, bias=False, group_size=group_size)
+        self.drop      = nn.Dropout(dropout)
+
+    def forward(self, x):
+        gate = F.silu(self.gate_proj(x))
+        up   = self.up_proj(x)
+        return self.drop(self.down_proj(gate * up))
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd: int, n_head: int, dropout: float, group_size: int = 64):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head   = n_head
+        self.head_dim = n_embd // n_head
+        self.qkv      = QATLinear(n_embd, 3 * n_embd, bias=False, group_size=group_size)
+        self.proj     = QATLinear(n_embd, n_embd,     bias=False, group_size=group_size)
+        self.attn_drop  = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
+            persistent=False
+        )
+
+    def forward(self, x, cos, sin):
+        B, T, C = x.size()
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y   = att @ v
+        y   = y.transpose(1, 2).contiguous().view(B, T, C)
+        y   = self.resid_drop(self.proj(y))
+        return y
+
+
+class Block(nn.Module):
+    def __init__(self, n_embd: int, n_head: int, dropout: float, group_size: int = 64):
+        super().__init__()
+        self.ln1  = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, dropout, group_size)
+        self.ln2  = nn.LayerNorm(n_embd)
+        self.mlp  = SwiGLUMLP(n_embd, dropout, group_size)
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.ln1(x), cos, sin)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, group_size: int = 64):
+        super().__init__()
+        self.group_size = group_size
+        self.tok_emb = nn.Embedding(vocab_size, n_embd)
+        self.drop    = nn.Dropout(dropout)
+        self.blocks  = nn.ModuleList(
+            [Block(n_embd, n_head, dropout, group_size) for _ in range(n_layer)]
+        )
+        self.ln_f    = nn.LayerNorm(n_embd)
+        self.head    = nn.Linear(n_embd, vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight
+        head_dim = n_embd // n_head
+        cos, sin = precompute_freqs(head_dim, block_size, device="cpu")
+        self.register_buffer("rope_cos", cos, persistent=True)
+        self.register_buffer("rope_sin", sin, persistent=True)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, QATLinear)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        x    = self.drop(self.tok_emb(idx).float())
+        cos  = self.rope_cos[:T].to(x.device)
+        sin  = self.rope_sin[:T].to(x.device)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        x      = self.ln_f(x)
+        logits = self.head(x)
+        loss   = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                label_smoothing=label_smoothing
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temp=temperature, top_k=3, rep_penalty=1.5):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :].clone()   # (1, vocab_size)
+            for token_id in set(idx_cond[0].tolist()):
+                logits[0, token_id] /= rep_penalty
+            logits = logits / temp
+            if top_k > 0 and top_k < logits.size(-1):
+                thresh = torch.topk(logits, top_k).values[:, -1, None]
+                logits[logits < thresh] = float("-inf")
+
+            probs   = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx     = torch.cat((idx, next_id), dim=1)
+        return idx
+
+
+@torch.no_grad()
+def estimate_loss():
     model.eval()
+    out = {}
+    for split in ["train", "val"]:
+        losses = []
+        for _ in range(eval_iters):
+            xb, yb = get_batch(split)
+            _, loss = model(xb, yb)
+            losses.append(loss.item())
+        out[split] = sum(losses) / len(losses)
+    model.train()
+    return out
+
+
+def convert_to_int4(model: nn.Module) -> nn.Module:
     for name, child in model.named_children():
-        if isinstance(child, nn.Linear):
-            bias = child.bias.detach() if child.bias is not None else None
-            setattr(model, name, Int4Linear(child.in_features, child.out_features,
-                                           child.weight.detach(), bias, group_size))
+        if isinstance(child, QATLinear):
+            setattr(model, name, child.to_int4())
         else:
-            quantize_model(child, group_size)
-    for name, child in model.named_modules():
-        if isinstance(child, nn.Embedding):
-            child.weight.data = child.weight.data.half()
+            convert_to_int4(child)
     return model
-    
+
+
 def train():
-    best_val_loss = float('inf')
+    global model
+    best_val_loss    = float("inf")
     patience_counter = 0
+    # Single cosine decay (no restarts) — restarts caused val loss to spike
+    scheduler = CosineAnnealingLR(optimizer, T_max=3000, eta_min=lr_min)
+
     for it in range(start_iter, max_iters + 1):
+        # Linear warmup: override LR for the first warmup_iters steps
+        if it < warmup_iters:
+            warmup_lr = lr * (it + 1) / warmup_iters
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
         if it % eval_interval == 0:
             losses = estimate_loss()
-            print(f"iter {it:4d} | train loss {losses['train']:.3f} | val loss {losses['val']:.3f}")
-            if losses['val'] < best_val_loss:
-                best_val_loss = losses['val']
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print(f"iter {it:5d} | train {losses['train']:.4f} | val {losses['val']:.4f} "
+                  f"| lr {cur_lr:.2e}")
+            if losses["val"] < best_val_loss:
+                best_val_loss    = losses["val"]
                 patience_counter = 0
                 torch.save(model.state_dict(), checkpoint + ".best")
+                print(f"  ✓ new best ({best_val_loss:.4f}) saved")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print("Early stopping.")
+                    print("Early stopping triggered.")
                     break
 
         xb, yb = get_batch("train")
@@ -247,56 +371,87 @@ def train():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=1000, T_mult=2)
         optimizer.step()
+        if it >= warmup_iters:
+            scheduler.step()
+
     torch.save(model.state_dict(), checkpoint)
-    print("Unquantized model saved to", checkpoint)
-    quantized_model = quantize_model(copy.deepcopy(model))
+    print("Full-precision model saved to", checkpoint)
+
+    # Always quantize the BEST checkpoint, not the overfit last model
+    if os.path.isfile(checkpoint + ".best"):
+        model.load_state_dict(torch.load(checkpoint + ".best", map_location=device))
+        model.eval()
+        print("Loaded best checkpoint for quantization.")
+
+    q_model = convert_to_int4(copy.deepcopy(model))
     with gzip.open(checkpoint + ".quantized", "wb") as f:
-        torch.save(quantized_model, f)   # save full object, gzip-compressed
+        torch.save(q_model, f)
     quant_size = os.path.getsize(checkpoint + ".quantized")
-    print("Quantized model saved to", checkpoint + ".quantized", "Size:", quant_size / 1024, "KB")
+    print(f"Quantized model saved → {checkpoint}.quantized  ({quant_size/1024:.1f} KB)")
+
 
 def load_model():
     global model
-    if use_quantized and os.path.isfile(checkpoint + ".quantized"):
-        print("Loading quantized model...")
+
+    if os.path.isfile(checkpoint + ".quantized"):
+        print("Loading quantized model (primary)...")
+        with gzip.open(checkpoint + ".quantized", "rb") as f:
+            model = torch.load(f, map_location=device, weights_only=False)
+        model.to(device)
+        model.eval()
+        print("Quantized model ready.")
+        return
+
+    src = None
+    if os.path.isfile(checkpoint + ".best"):
+        src = checkpoint + ".best"
+    elif os.path.isfile(checkpoint):
+        src = checkpoint
+
+    if src:
+        print(f"Loading unquantized checkpoint from {src} and quantizing...")
+        model.load_state_dict(torch.load(src, map_location=device))
+        model.eval()
+        q_model = convert_to_int4(copy.deepcopy(model))
+        with gzip.open(checkpoint + ".quantized", "wb") as f:
+            torch.save(q_model, f)
+        print(f"Quantized and saved → {checkpoint}.quantized")
         with gzip.open(checkpoint + ".quantized", "rb") as f:
             model = torch.load(f, map_location=device, weights_only=False)
         model.to(device)
         model.eval()
         return
-    model = Transformer().to(device)
-    if os.path.isfile(checkpoint + ".best"):
-        model.load_state_dict(torch.load(checkpoint + ".best", map_location=device))
-        print("Loaded best unquantized model.")
-    elif os.path.isfile(checkpoint):
-        model.load_state_dict(torch.load(checkpoint, map_location=device))
-        print("Loaded unquantized model.")
-    else:
-        print("No checkpoint found. Training from scratch...")
-        train()
-        model.load_state_dict(torch.load(checkpoint))
+
+    print("No checkpoint found — training from scratch...")
+    train()
+    load_model()
+
 
 def generate_reply(max_token_length):
     user_input = input("User: ")
-    prompt = f"User: {user_input}\nBot:"
-    context = encode(prompt).unsqueeze(0).to(device)
+    if not user_input.strip():
+        return
+    prompt     = f"User: {user_input}\nBot:"
+    context    = encode(prompt).unsqueeze(0).to(device)
     output_ids = model.generate(context, max_new_tokens=max_token_length)
-    full_response = decode(output_ids[0].tolist())
+    full       = decode(output_ids[0].tolist())
 
-    bot_idx = full_response.find("Bot:")
+    bot_idx = full.find("Bot:")
     if bot_idx != -1:
-        reply = full_response[bot_idx + 4:].strip()
+        reply = full[bot_idx + 4:].strip()
         if "\nUser:" in reply:
             reply = reply.split("\nUser:")[0]
+        if "\nBot:" in reply:
+            reply = reply.split("\nBot:")[0]
         print("Bot:", reply)
     else:
-        print(full_response) 
+        print(full)
+
 
 if __name__ == "__main__":
-    model = Transformer().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    model     = Transformer(group_size=qat_group_size).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     load_model()
     while True:
-        generate_reply(70)
+        generate_reply(50)
