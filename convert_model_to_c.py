@@ -1,242 +1,199 @@
-"""
-convert_model_to_c.py
-Converts model.pt.quantized → src/model_weights.hpp
-
-Exports named C arrays for every weight tensor plus vocab lookup tables
-so the ESP32 firmware can run a full transformer forward pass and encode/
-decode text without any Python dependency.
-"""
-
-import gzip, math, os, struct, sys
-import torch
-import torch.nn.functional as F
-
-import main
-sys.modules['__main__'] = main
-
-QUANTIZED_PATH = "model/model.pt.quantized"
-DATASET_PATH   = "dataset.txt"
-OUTPUT_PATH    = "src/model_weights.hpp"
-GROUP_SIZE     = 64
-
-print(f"Loading {QUANTIZED_PATH} ...")
-with gzip.open(QUANTIZED_PATH, "rb") as f:
-    model = torch.load(f, map_location="cpu", weights_only=False)
-model.eval()
-print("Model loaded.")
-
-print(f"Reading vocab from {DATASET_PATH} ...")
-with open(DATASET_PATH, "r") as f:
-    text = f.read()
-chars      = sorted(list(set(text)))
-vocab_size = len(chars)
-stoi       = {ch: i for i, ch in enumerate(chars)}
-itos       = {i: ch for ch, i in stoi.items()}
-print(f"  vocab_size = {vocab_size}")
-
-# char_to_id[256]: uint8, value 255 = unknown
-char_to_id_table = [255] * 256
-for ch, idx in stoi.items():
-    if ord(ch) < 256:
-        char_to_id_table[ord(ch)] = idx
-
-# vocab_chars[vocab_size]: uint8, id→char (as ASCII byte)
-vocab_chars_table = [ord(itos[i]) if ord(itos[i]) < 256 else ord('?') for i in range(vocab_size)]
-
-def pack_int4(weight: torch.Tensor, group_size: int = GROUP_SIZE):
-    out, n = weight.shape
-    n_groups = math.ceil(n / group_size)
-    padded_n = n_groups * group_size
-    w = F.pad(weight.float(), (0, padded_n - n)) if padded_n != n else weight.float()
-    wg   = w.view(out, n_groups, group_size)
-    wmin = wg.min(dim=-1, keepdim=True).values
-    wmax = wg.max(dim=-1, keepdim=True).values
-    scale = (wmax - wmin) / 15.0
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    zp    = torch.round(-wmin / scale)
-    q     = torch.clamp(torch.round(wg / scale) + zp, 0, 15).to(torch.uint8)
-    q     = q.view(out, padded_n)[:, :n]
-    m = q.shape[1]
-    if m % 2:
-        q = F.pad(q, (0, 1))
-    packed = (q[:, 0::2] & 0x0F) | ((q[:, 1::2] << 4) & 0xF0)
-    return packed.to(torch.uint8), scale.squeeze(-1), zp.squeeze(-1)
-
-
-def get_weight(mod):
-    """Extract float32 weight from either QATLinear or Int4Linear."""
-    if hasattr(mod, "qweight"):
-        # Int4Linear — dequantize
-        m = mod.qweight.shape[1]
-        q = torch.empty(mod.out_features, m * 2, dtype=torch.uint8)
-        q[:, 0::2] = mod.qweight & 0x0F
-        q[:, 1::2] = (mod.qweight >> 4) & 0x0F
-        q = q[:, :mod.in_features].float()
-        n  = mod.in_features
-        gs = mod.group_size
-        groups = torch.arange(n) // gs
-        scale  = mod.scale.float()
-        zp     = mod.zero_point.float()
-        return (q - zp[:, groups]) * scale[:, groups]
-    elif hasattr(mod, "weight"):
-        return mod.weight.detach().float()
-    raise ValueError(f"Unknown layer type: {type(mod)}")
-
-def emit_f32(arr, name):
-    flat = arr.detach().cpu().float().numpy().flatten()
-    lines = [f"static const float {name}[{len(flat)}] PROGMEM = {{"]
-    row = []
-    for i, v in enumerate(flat):
-        row.append(f"{v:.6f}f")
-        if len(row) == 8 or i == len(flat) - 1:
-            lines.append("    " + ", ".join(row) + ",")
-            row = []
-    lines.append("};\n")
-    return "\n".join(lines)
-
-
-def emit_u8(arr, name):
-    flat = arr.detach().cpu().numpy().flatten()
-    lines = [f"static const uint8_t {name}[{len(flat)}] PROGMEM = {{"]
-    row = []
-    for i, v in enumerate(flat):
-        row.append(f"0x{int(v):02x}")
-        if len(row) == 12 or i == len(flat) - 1:
-            lines.append("    " + ", ".join(row) + ",")
-            row = []
-    lines.append("};\n")
-    return "\n".join(lines)
-
-
-def emit_linear(prefix, weight, bias=None):
-    packed, scale, zp = pack_int4(weight)
-    parts = [
-        emit_u8(packed, f"{prefix}_weights"),
-        emit_f32(scale, f"{prefix}_scales"),
-        emit_f32(zp,    f"{prefix}_zp"),
+import gzip ,math ,os ,struct ,sys 
+import torch 
+import torch .nn .functional as F 
+import main 
+sys .modules ['__main__']=main 
+QUANTIZED_PATH ="model/model.pt.quantized"
+DATASET_PATH ="dataset.txt"
+OUTPUT_PATH ="src/model_weights.hpp"
+GROUP_SIZE =64 
+print (f"Loading {QUANTIZED_PATH } ...")
+try :
+    with gzip .open (QUANTIZED_PATH ,"rb")as f :
+        import main 
+        sys .modules ['__main__']=main 
+        model =torch .load (f ,map_location ="cpu",weights_only =False )
+    print ("Model loaded.")
+except AttributeError :
+    raise 
+def unicode_to_bytes ():
+    bs =list (range (ord ('!'),ord ('~')+1 ))+list (range (ord ('¡'),ord ('¬')+1 ))+list (range (ord ('®'),ord ('ÿ')+1 ))
+    cs =bs [:]
+    n =0 
+    for b in range (2 **8 ):
+        if b not in bs :
+            bs .append (b )
+            cs .append (2 **8 +n )
+            n +=1 
+    cs =[chr (n )for n in cs ]
+    return dict (zip (cs ,bs ))
+u2b =unicode_to_bytes ()
+import json 
+with open ("bpe-vocab.json","r")as f :
+    vocab_dict =json .load (f )
+vocab_size =len (vocab_dict )
+v2i ={v :k for k ,v in vocab_dict .items ()}
+vocab_bytes_flat =bytearray ()
+vocab_offsets =[]
+for i in range (vocab_size ):
+    vocab_offsets .append (len (vocab_bytes_flat ))
+    token_str =v2i [i ]
+    b =bytes ([u2b [c ]for c in token_str ])
+    vocab_bytes_flat .extend (b )
+vocab_offsets .append (len (vocab_bytes_flat ))
+def pack_int4 (weight :torch .Tensor ,group_size :int =GROUP_SIZE ):
+    out ,n =weight .shape 
+    n_groups =math .ceil (n /group_size )
+    padded_n =n_groups *group_size 
+    w =F .pad (weight .float (),(0 ,padded_n -n ))if padded_n !=n else weight .float ()
+    wg =w .view (out ,n_groups ,group_size )
+    wmin =wg .min (dim =-1 ,keepdim =True ).values 
+    wmax =wg .max (dim =-1 ,keepdim =True ).values 
+    scale =(wmax -wmin )/15.0 
+    scale =torch .where (scale ==0 ,torch .ones_like (scale ),scale )
+    zp =torch .round (-wmin /scale )
+    q =torch .clamp (torch .round (wg /scale )+zp ,0 ,15 ).to (torch .uint8 )
+    q =q .view (out ,padded_n )[:,:n ]
+    m =q .shape [1 ]
+    if m %2 :
+        q =F .pad (q ,(0 ,1 ))
+    packed =(q [:,0 ::2 ]&0x0F )|((q [:,1 ::2 ]<<4 )&0xF0 )
+    return packed .to (torch .uint8 ),scale .squeeze (-1 ),zp .squeeze (-1 )
+def get_quantized (mod ):
+    if hasattr (mod ,"qweight"):
+        return mod .qweight ,mod .scale .float (),mod .zero_point .float ()
+    elif hasattr (mod ,"weight"):
+        packed ,scale ,zp =pack_int4 (mod .weight )
+        return packed ,scale ,zp 
+    raise ValueError (f"Unknown layer type: {type (mod )}")
+def emit_f32 (arr ,name ):
+    flat =arr .detach ().cpu ().float ().numpy ().flatten ()
+    lines =[f"static const float {name }[{len (flat )}] PROGMEM = {{"]
+    row =[]
+    for i ,v in enumerate (flat ):
+        row .append (f"{v :.6f}f")
+        if len (row )==8 or i ==len (flat )-1 :
+            lines .append ("    "+", ".join (row )+",")
+            row =[]
+    lines .append ("};\n")
+    return "\n".join (lines )
+def emit_u8 (arr ,name ):
+    flat =arr .detach ().cpu ().numpy ().flatten ()
+    lines =[f"static const uint8_t {name }[{len (flat )}] PROGMEM = {{"]
+    row =[]
+    for i ,v in enumerate (flat ):
+        row .append (f"0x{int (v ):02x}")
+        if len (row )==12 or i ==len (flat )-1 :
+            lines .append ("    "+", ".join (row )+",")
+            row =[]
+    lines .append ("};\n")
+    return "\n".join (lines )
+def emit_quantized (prefix ,qweight ,scale ,zp ,bias =None ):
+    parts =[
+    emit_u8 (qweight ,f"{prefix }_weights"),
+    emit_f32 (scale ,f"{prefix }_scales"),
+    emit_f32 (zp ,f"{prefix }_zp"),
     ]
-    if bias is not None:
-        parts.append(emit_f32(bias.float(), f"{prefix}_bias"))
-    return "\n".join(parts)
-
-tok_emb_w  = None
-for name, mod in model.named_modules():
-    if name == "tok_emb":
-        tok_emb_w = mod.weight.detach().float()
-
-n_embd     = tok_emb_w.shape[1]
-n_layer    = len(model.blocks)
-n_head     = model.blocks[0].attn.n_head
-head_dim   = n_embd // n_head
-block_size = model.rope_cos.shape[0]
-
-# MLP hidden size
-mlp = model.blocks[0].mlp
-mlp_hidden = get_weight(mlp.gate_proj).shape[0]
-
-print(f"  n_embd={n_embd}  n_layer={n_layer}  n_head={n_head}  "
-      f"head_dim={head_dim}  mlp_hidden={mlp_hidden}  block_size={block_size}")
-
-theta    = 10000.0 ** (-torch.arange(0, head_dim, 2).float() / head_dim)
-t        = torch.arange(block_size).float()
-freqs    = torch.outer(t, theta)
-rope_cos = freqs.cos()   # (block_size, head_dim/2)
-rope_sin = freqs.sin()
-
-sections = []
-total_bytes = 0
-
-sections.append(f"""\
+    if bias is not None :
+        parts .append (emit_f32 (bias .float (),f"{prefix }_bias"))
+    return "\n".join (parts )
+tok_emb_w =None 
+for name ,mod in model .named_modules ():
+    if name =="tok_emb":
+        tok_emb_w =mod .weight .detach ().float ()
+n_embd =tok_emb_w .shape [1 ]
+n_layer =len (model .blocks )
+n_head =model .blocks [0 ].attn .n_head 
+n_kv_head =model .blocks [0 ].attn .qkv .out_features 
+n_kv_head =int ((n_kv_head -n_embd )/2 /(n_embd //n_head ))
+head_dim =n_embd //n_head 
+block_size =model .rope_cos .shape [0 ]
+mlp =model .blocks [0 ].mlp 
+first_gate_q ,_ ,_ =get_quantized (mlp .experts [0 ].gate_proj )
+mlp_hidden =first_gate_q .shape [0 ]
+n_experts =len (mlp .experts )
+print (f"  n_embd={n_embd }  n_layer={n_layer }  n_head={n_head }  "
+f"head_dim={head_dim }  mlp_hidden={mlp_hidden }  block_size={block_size }")
+theta =10000.0 **(-torch .arange (0 ,head_dim ,2 ).float ()/head_dim )
+t =torch .arange (block_size ).float ()
+freqs =torch .outer (t ,theta )
+rope_cos =freqs .cos ()
+rope_sin =freqs .sin ()
+sections =[]
+total_bytes =0 
+sections .append (f"""\
 // Auto-generated by convert_model_to_c.py — DO NOT EDIT
 #ifndef MODEL_WEIGHTS_HPP
 #define MODEL_WEIGHTS_HPP
-
 #include <stdint.h>
 #include <stddef.h>
-
 #ifdef __AVR__
 #  include <avr/pgmspace.h>
 #else
 #  define PROGMEM
 #endif
-
-static const uint16_t model_vocab_size = {vocab_size};
-static const uint16_t model_n_embd     = {n_embd};
-static const uint8_t  model_n_layer    = {n_layer};
-static const uint8_t  model_n_head     = {n_head};
-static const uint16_t model_block_size = {block_size};
-static const uint8_t  model_group_size = {GROUP_SIZE};
-static const uint16_t model_mlp_hidden = {mlp_hidden};
+static const uint16_t model_vocab_size = {vocab_size };
+static const uint16_t model_n_embd     = {n_embd };
+static const uint8_t  model_n_layer    = {n_layer };
+static const uint8_t  model_n_head     = {n_head };
+static const uint16_t model_block_size = {block_size };
+static const uint8_t  model_group_size = {GROUP_SIZE };
+static const uint16_t model_mlp_hidden = {mlp_hidden };
+static const uint8_t  model_n_experts  = {n_experts };
+static const uint8_t  model_n_kv_head  = {n_kv_head };
 """)
-
-# Vocabulary
-sections.append(f"static const uint8_t vocab_chars[{vocab_size}] PROGMEM = {{")
-sections.append("    " + ", ".join(str(b) for b in vocab_chars_table) + "\n};\n")
-
-sections.append("static const uint8_t char_to_id[256] PROGMEM = {")
-rows = []
-for i in range(0, 256, 16):
-    rows.append("    " + ", ".join(str(char_to_id_table[j]) for j in range(i, min(i+16, 256))))
-sections.append(",\n".join(rows) + "\n};\n")
-total_bytes += vocab_size + 256
-
-# Token embedding
-emb_bytes = tok_emb_w.numel() * 4
-sections.append(emit_f32(tok_emb_w.flatten(), "tok_emb"))
-total_bytes += emb_bytes
-
-# RoPE tables
-sections.append(emit_f32(rope_cos.flatten(), "rope_cos"))
-sections.append(emit_f32(rope_sin.flatten(), "rope_sin"))
-total_bytes += rope_cos.numel() * 4 * 2
-
-# Per-layer weights
-for li, block in enumerate(model.blocks):
-    attn = block.attn
-    qkv_w   = get_weight(attn.qkv)
-    proj_w  = get_weight(attn.proj)
-    gate_w  = get_weight(block.mlp.gate_proj)
-    up_w    = get_weight(block.mlp.up_proj)
-    down_w  = get_weight(block.mlp.down_proj)
-
-    sections.append(emit_linear(f"l{li}_attn_qkv",      qkv_w))
-    sections.append(emit_linear(f"l{li}_attn_proj",     proj_w))
-    sections.append(emit_linear(f"l{li}_mlp_gate_proj", gate_w))
-    sections.append(emit_linear(f"l{li}_mlp_up_proj",   up_w))
-    sections.append(emit_linear(f"l{li}_mlp_down_proj", down_w))
-
-    sections.append(emit_f32(block.ln1.weight.detach().float(), f"l{li}_ln1_gamma"))
-    sections.append(emit_f32(block.ln1.bias.detach().float(),   f"l{li}_ln1_beta"))
-    sections.append(emit_f32(block.ln2.weight.detach().float(), f"l{li}_ln2_gamma"))
-    sections.append(emit_f32(block.ln2.bias.detach().float(),   f"l{li}_ln2_beta"))
-
-    layer_bytes = (qkv_w.numel() + proj_w.numel() + gate_w.numel() +
-                   up_w.numel() + down_w.numel()) // 2
-    total_bytes += layer_bytes
-
-# Final layernorm
-sections.append(emit_f32(model.ln_f.weight.detach().float(), "ln_f_gamma"))
-sections.append(emit_f32(model.ln_f.bias.detach().float(),   "ln_f_beta"))
-
-# Legacy alias for backward compatibility
-first_qkv = model.blocks[0].attn.qkv
-fqw = get_weight(first_qkv)
-packed_legacy, _, _ = pack_int4(fqw)
-sections.append(emit_u8(packed_legacy, "model_weights"))
-sections.append(f"static const unsigned int model_weights_len = {packed_legacy.numel()};\n")
-
-sections.append("#endif // MODEL_WEIGHTS_HPP\n")
-
-os.makedirs("src", exist_ok=True)
-with open(OUTPUT_PATH, "w") as f:
-    f.write("\n".join(sections))
-
-file_kb = os.path.getsize(OUTPUT_PATH) / 1024
-print(f"\nWrote {OUTPUT_PATH}  ({file_kb:.0f} KB source)")
-print(f"Estimated binary flash usage: ~{total_bytes//1024} KB")
-print("\nArrays exported:")
-print(f"  vocab_chars[{vocab_size}], char_to_id[256]")
-print(f"  tok_emb[{vocab_size}×{n_embd}], rope_cos/sin[{block_size}×{head_dim//2}]")
-for li in range(n_layer):
-    print(f"  l{li}: qkv, proj, gate_proj, up_proj, down_proj, ln1, ln2")
-print("  ln_f_gamma, ln_f_beta")
+sections .append (emit_u8 (torch .tensor (list (vocab_bytes_flat ),dtype =torch .uint8 ),"model_vocab_bytes"))
+sections .append (f"static const uint32_t model_vocab_offsets[{vocab_size +1 }] PROGMEM = {{")
+sections .append ("    "+", ".join (str (o )for o in vocab_offsets )+"\n};\n")
+total_bytes +=len (vocab_bytes_flat )+(vocab_size +1 )*4 
+emb_bytes =tok_emb_w .numel ()*4 
+sections .append (emit_f32 (tok_emb_w .flatten (),"tok_emb"))
+total_bytes +=emb_bytes 
+sections .append (emit_f32 (rope_cos .flatten (),"rope_cos"))
+sections .append (emit_f32 (rope_sin .flatten (),"rope_sin"))
+total_bytes +=rope_cos .numel ()*4 *2 
+for li ,block in enumerate (model .blocks ):
+    attn =block .attn 
+    qkv_q ,qkv_s ,qkv_z =get_quantized (attn .qkv )
+    proj_q ,proj_s ,proj_z =get_quantized (attn .proj )
+    sections .append (emit_quantized (f"l{li }_attn_qkv",qkv_q ,qkv_s ,qkv_z ))
+    sections .append (emit_quantized (f"l{li }_attn_proj",proj_q ,proj_s ,proj_z ))
+    sections .append (emit_f32 (block .ln1 .weight .detach ().float (),f"l{li }_ln1_gamma"))
+    sections .append (emit_f32 (block .ln2 .weight .detach ().float (),f"l{li }_ln2_gamma"))
+    router_w =block .mlp .router .weight .detach ().float ().flatten ()
+    sections .append (emit_f32 (router_w ,f"l{li }_router"))
+    total_bytes +=router_w .numel ()*4 
+    gate_qs ,gate_ss ,gate_zs =zip (*[get_quantized (expert .gate_proj )for expert in block .mlp .experts ])
+    up_qs ,up_ss ,up_zs =zip (*[get_quantized (expert .up_proj )for expert in block .mlp .experts ])
+    down_qs ,down_ss ,down_zs =zip (*[get_quantized (expert .down_proj )for expert in block .mlp .experts ])
+    gate_q_concat =torch .cat (gate_qs ,dim =0 )
+    gate_s_concat =torch .cat (gate_ss ,dim =0 )
+    gate_z_concat =torch .cat (gate_zs ,dim =0 )
+    up_q_concat =torch .cat (up_qs ,dim =0 )
+    up_s_concat =torch .cat (up_ss ,dim =0 )
+    up_z_concat =torch .cat (up_zs ,dim =0 )
+    down_q_concat =torch .cat (down_qs ,dim =0 )
+    down_s_concat =torch .cat (down_ss ,dim =0 )
+    down_z_concat =torch .cat (down_zs ,dim =0 )
+    sections .append (emit_quantized (f"l{li }_experts_gate",gate_q_concat ,gate_s_concat ,gate_z_concat ))
+    sections .append (emit_quantized (f"l{li }_experts_up",up_q_concat ,up_s_concat ,up_z_concat ))
+    sections .append (emit_quantized (f"l{li }_experts_down",down_q_concat ,down_s_concat ,down_z_concat ))
+    layer_bytes =qkv_q .numel ()+proj_q .numel ()+gate_q_concat .numel ()+up_q_concat .numel ()+down_q_concat .numel ()
+    total_bytes +=layer_bytes 
+sections .append (emit_f32 (model .ln_f .weight .detach ().float (),"ln_f_gamma"))
+first_qkv_q ,_ ,_ =get_quantized (model .blocks [0 ].attn .qkv )
+sections .append (emit_u8 (first_qkv_q ,"model_weights"))
+sections .append (f"static const unsigned int model_weights_len = {first_qkv_q .numel ()};\n")
+sections .append ("#endif // MODEL_WEIGHTS_HPP\n")
+os .makedirs ("src",exist_ok =True )
+with open (OUTPUT_PATH ,"w")as f :
+    f .write ("\n".join (sections ))
+file_kb =os .path .getsize (OUTPUT_PATH )/1024 
+print (f"\nWrote {OUTPUT_PATH }  ({file_kb :.0f} KB source)")
+print (f"Estimated binary flash usage: ~{total_bytes //1024 } KB")
+print ("\nArrays exported:")
+print (f"  model_vocab_bytes[{len (vocab_bytes_flat )}], model_vocab_offsets[{vocab_size +1 }]")
+print (f"  tok_emb[{vocab_size }×{n_embd }], rope_cos/sin[{block_size }×{head_dim //2 }]")
+for li in range (n_layer ):
+    print (f"  l{li }: qkv, proj, gate_proj, up_proj, down_proj, ln1, ln2")
+print ("  ln_f_gamma")

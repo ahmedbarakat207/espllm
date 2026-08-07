@@ -1,6 +1,5 @@
 #ifndef ESP32_INFERENCE_HPP
 #define ESP32_INFERENCE_HPP
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -19,7 +18,6 @@ public:
         offset = 0;
     }
     ~MemoryArena() { if (buffer) free(buffer); }
-
     void* alloc(size_t sz) {
         sz = (sz + 3u) & ~3u;
         if (offset + sz > cap) return nullptr;
@@ -40,9 +38,17 @@ static inline float dot_f32(const float* a, const float* b, int n) {
     return s;
 }
 
-static inline void unpack_nibbles(uint8_t packed, uint8_t& lo, uint8_t& hi) {
-    lo = packed & 0x0Fu;
-    hi = (packed >> 4) & 0x0Fu;
+struct NibblePair { float lo; float hi; };
+
+static NibblePair unpack_lut[256];
+static bool lut_init = false;
+static void init_unpack_lut() {
+    if (lut_init) return;
+    for (int i = 0; i < 256; ++i) {
+        unpack_lut[i].lo = (float)(i & 0x0F);
+        unpack_lut[i].hi = (float)(i >> 4);
+    }
+    lut_init = true;
 }
 
 void matmul_int4_f32(
@@ -57,38 +63,52 @@ void matmul_int4_f32(
 ) {
     const int n_groups = (in_features + group_size - 1) / group_size;
     const int k_bytes  = (in_features + 1) / 2;
-
     for (int i = 0; i < out_features; ++i) {
         float acc = 0.0f;
         const uint8_t* w_row = W_packed + (size_t)i * k_bytes;
         const float*   s_row = scales   + (size_t)i * n_groups;
         const float*   z_row = zp       + (size_t)i * n_groups;
-
-        for (int j = 0; j < k_bytes; ++j) {
-            uint8_t lo, hi;
-            unpack_nibbles(w_row[j], lo, hi);
+        init_unpack_lut();
+        for (int j = 0; j < k_bytes; j += 4) {
+            uint8_t p0 = w_row[j];
+            uint8_t p1 = w_row[j+1];
+            uint8_t p2 = w_row[j+2];
+            uint8_t p3 = w_row[j+3];
             int col0 = j * 2;
-            int col1 = col0 + 1;
-            int g0   = col0 / group_size;
-            acc += ((float)lo - z_row[g0]) * s_row[g0] * x[col0];
-            if (col1 < in_features) {
-                int g1 = col1 / group_size;
-                acc += ((float)hi - z_row[g1]) * s_row[g1] * x[col1];
-            }
+            int g0 = col0 / group_size;
+            int g1 = (col0 + 1) / group_size;
+            int g2 = (col0 + 2) / group_size;
+            int g3 = (col0 + 3) / group_size;
+            int g4 = (col0 + 4) / group_size;
+            int g5 = (col0 + 5) / group_size;
+            int g6 = (col0 + 6) / group_size;
+            int g7 = (col0 + 7) / group_size;
+            NibblePair u0 = unpack_lut[p0];
+            NibblePair u1 = unpack_lut[p1];
+            NibblePair u2 = unpack_lut[p2];
+            NibblePair u3 = unpack_lut[p3];
+            float w0 = u0.lo - z_row[g0];
+            float w1 = u0.hi - z_row[g1];
+            float w2 = u1.lo - z_row[g2];
+            float w3 = u1.hi - z_row[g3];
+            float w4 = u2.lo - z_row[g4];
+            float w5 = u2.hi - z_row[g5];
+            float w6 = u3.lo - z_row[g6];
+            float w7 = u3.hi - z_row[g7];
+            acc += w0 * s_row[g0] * x[col0]     + w1 * s_row[g1] * x[col0 + 1]
+                 + w2 * s_row[g2] * x[col0 + 2] + w3 * s_row[g3] * x[col0 + 3]
+                 + w4 * s_row[g4] * x[col0 + 4] + w5 * s_row[g5] * x[col0 + 5]
+                 + w6 * s_row[g6] * x[col0 + 6] + w7 * s_row[g7] * x[col0 + 7];
         }
         y[i] = acc;
     }
 }
 
-void layer_norm(const float* x, float* y, const float* gamma, const float* beta, int n, float eps = 1e-5f) {
-    float mean = 0.0f;
-    for (int i = 0; i < n; ++i) mean += x[i];
-    mean /= n;
-    float var = 0.0f;
-    for (int i = 0; i < n; ++i) { float d = x[i] - mean; var += d * d; }
-    var /= n;
-    float inv_std = 1.0f / sqrtf(var + eps);
-    for (int i = 0; i < n; ++i) y[i] = (x[i] - mean) * inv_std * gamma[i] + beta[i];
+void rms_norm(const float* x, float* y, const float* gamma, int n, float eps = 1e-5f) {
+    float sum_sq = 0.0f;
+    for (int i = 0; i < n; ++i) sum_sq += x[i] * x[i];
+    float inv_rms = 1.0f / sqrtf(sum_sq / n + eps);
+    for (int i = 0; i < n; ++i) y[i] = x[i] * inv_rms * gamma[i];
 }
 
 void softmax(float* x, int n) {
@@ -100,7 +120,6 @@ void softmax(float* x, int n) {
 }
 
 static inline float silu(float x) { return x / (1.0f + expf(-x)); }
-
 void swiglu(const float* gate, const float* up, float* out, int n) {
     for (int i = 0; i < n; ++i) out[i] = silu(gate[i]) * up[i];
 }
@@ -120,5 +139,4 @@ int argmax(const float* x, int n) {
     for (int i = 1; i < n; ++i) if (x[i] > x[best]) best = i;
     return best;
 }
-
 #endif
