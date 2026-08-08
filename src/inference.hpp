@@ -126,12 +126,16 @@ void swiglu(const float* gate, const float* up, float* out, int n) {
 
 void apply_rope_row(float* x, const float* cos_row, const float* sin_row, int head_dim) {
     int half = head_dim / 2;
+    float tmp[64];
     for (int i = 0; i < half; ++i) {
         float x0 = x[2 * i];
         float x1 = x[2 * i + 1];
-        x[2 * i]     = x0 * cos_row[i] - x1 * sin_row[i];
-        x[2 * i + 1] = x0 * sin_row[i] + x1 * cos_row[i];
+        float c = cos_row[i];
+        float s = sin_row[i];
+        tmp[i]        = x0 * c - x1 * s;
+        tmp[half + i] = x0 * s + x1 * c;
     }
+    memcpy(x, tmp, head_dim * sizeof(float));
 }
 
 int argmax(const float* x, int n) {

@@ -11,10 +11,17 @@ static constexpr int HEAD_DIM        = N_EMBD / N_HEAD;
 static constexpr int MLP_HIDDEN      = 128;              
 static constexpr int N_EXPERTS       = 16;                
 static constexpr int GRP             = 64;                
-static constexpr int INFER_CTX       = 32;                
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+static constexpr int INFER_CTX       = 24;                
+static constexpr int MAX_GEN_TOKENS  = 50;
+static constexpr float TEMPERATURE   = 0.0f;
+static constexpr size_t ARENA_SIZE   = 46 * 1024;
+#else
+static constexpr int INFER_CTX       = 48;                
 static constexpr int MAX_GEN_TOKENS  = 80;
-static constexpr float TEMPERATURE   = 0.4f;
-static constexpr size_t ARENA_SIZE = 200 * 1024;
+static constexpr float TEMPERATURE   = 0.0f;
+static constexpr size_t ARENA_SIZE   = 88 * 1024;
+#endif
 
 static MemoryArena* arena = nullptr;
 static float* g_x;          
@@ -30,7 +37,7 @@ static float* g_mlp_up;
 static float* g_mlp_hidden; 
 static float* g_mlp_out;    
 static float* g_logits;     
-static uint8_t ctx_ids[INFER_CTX];
+static uint16_t ctx_ids[INFER_CTX];
 static int     ctx_len = 0;
 static int     ctx_pos = 0;
 
@@ -128,6 +135,7 @@ static void transformer_forward(int token, int pos) {
         matmul_int4_f32(lw.experts_down_q + down_q_off, lw.experts_down_s + down_s_off, lw.experts_down_z + down_s_off, 
                         g_mlp_hidden, g_mlp_out, N_EMBD, MLP_HIDDEN, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_mlp_out[d];
+        yield();
     }
     rms_norm(g_x, g_xnorm, ln_f_gamma, N_EMBD);
     for (int v = 0; v < (int)model_vocab_size; ++v)
@@ -147,9 +155,9 @@ static bool print_token(int id) {
     return has_newline;
 }
 
-static void ctx_push(uint8_t id) {
+static void ctx_push(uint16_t id) {
     if (ctx_len >= INFER_CTX) {
-        memmove(ctx_ids, ctx_ids + 1, (INFER_CTX - 1) * sizeof(uint8_t));
+        memmove(ctx_ids, ctx_ids + 1, (INFER_CTX - 1) * sizeof(uint16_t));
         ctx_len = INFER_CTX - 1;
         for (int l = 0; l < N_LAYER; ++l) {
             float* layer_kbuf = g_kbuf + l * (INFER_CTX * N_KV_HEAD * HEAD_DIM);
@@ -186,7 +194,7 @@ static void ctx_push_str(const char* text) {
             }
         }
         if (best_id != -1) {
-            ctx_push((uint8_t)best_id);
+            ctx_push((uint16_t)best_id);
             p += best_len;
         } else {
             p++;
@@ -200,16 +208,33 @@ static int sample_next(float temp) {
         transformer_forward(ctx_ids[ctx_pos], ctx_pos);
         ctx_pos++;
     }
+    for (int c = 0; c < ctx_len; ++c) {
+        uint16_t id = ctx_ids[c];
+        if (id < model_vocab_size) {
+            if (g_logits[id] > 0.0f) g_logits[id] /= 1.15f;
+            else g_logits[id] *= 1.15f;
+        }
+    }
     if (temp <= 0.0f) return argmax(g_logits, (int)model_vocab_size);
     for (int i = 0; i < (int)model_vocab_size; ++i) g_logits[i] /= temp;
     softmax(g_logits, (int)model_vocab_size);
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+    float r = (float)random(0, 1000000) / 1000000.0f;
+#else
     float r = (float)esp_random() / (float)UINT32_MAX;
+#endif
     float cdf = 0.0f;
     for (int i = 0; i < (int)model_vocab_size; ++i) {
         cdf += g_logits[i];
         if (r <= cdf) return i;
     }
     return model_vocab_size - 1;
+}
+
+static void init_few_shot() {
+    ctx_len = 0;
+    ctx_pos = 0;
+    ctx_push_str("User: hi\nBot: Hello\n");
 }
 
 static void run_chat() {
@@ -220,13 +245,23 @@ static void run_chat() {
         if (!Serial.available()) continue;
         char c = (char)Serial.read();
         if (c == '\n' || c == '\r') { if (ilen > 0) break; continue; }
+        if (c == '\b' || c == 0x7F) {
+            if (ilen > 0) {
+                ilen--;
+                Serial.print("\b \b");
+            }
+            continue;
+        }
         if (ilen < (int)sizeof(input) - 1) { input[ilen++] = c; Serial.print(c); }
     }
     input[ilen] = '\0';
     Serial.println();
     if (ilen == 0) return;
-    ctx_len = 0;
-    ctx_pos = 0;
+
+    if (ctx_len == 0) {
+        init_few_shot();
+    }
+
     char prompt[INFER_CTX * 2];
     snprintf(prompt, sizeof(prompt), "User: %s\nBot:", input);
     ctx_push_str(prompt);
@@ -237,10 +272,11 @@ static void run_chat() {
         int next_id  = sample_next(TEMPERATURE);
         if (next_id == 0) break; 
         bool hit_newline = print_token(next_id);
+        ctx_push((uint16_t)next_id);
         if (hit_newline && i > 3) break;
-        ctx_push((uint8_t)next_id);
         yield();
     }
+    ctx_push_str("\n");
     unsigned long elapsed = millis() - t_start;
     Serial.println();
     Serial.printf("[%lu ms total]\n", elapsed);
@@ -280,7 +316,11 @@ void setup() {
     delay(2000);
     Serial.println("\n╔══════════════════════════╗");
     Serial.println("║      ESP-LLM  v1.0       ║");
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+    Serial.println("║  INT4 Chatbot on ESP8266 ║");
+#else
     Serial.println("║  INT4 Chatbot on ESP32   ║");
+#endif
     Serial.println("╚══════════════════════════╝");
     Serial.printf("Free heap: %u B\n", (unsigned)ESP.getFreeHeap());
     arena = new MemoryArena(ARENA_SIZE);
@@ -298,6 +338,7 @@ void setup() {
                   (unsigned)arena->used(), (unsigned)arena->capacity());
     print_model_info();
     Serial.printf("Free heap after init: %u B\n\n", (unsigned)ESP.getFreeHeap());
+    init_few_shot();
     Serial.println("Type your message and press Enter.");
     Serial.println("──────────────────────────────────");
 }
