@@ -269,7 +269,7 @@ static bool alloc_buffers() {
     g_mlp_up     = (float*)arena->alloc(MLP_HIDDEN             * sizeof(float));
     g_mlp_hidden = (float*)arena->alloc(MLP_HIDDEN             * sizeof(float));
     g_mlp_out    = (float*)arena->alloc(N_EMBD                 * sizeof(float));
-    g_logits     = (float*)arena->alloc(128                    * sizeof(float));
+    g_logits     = (float*)arena->alloc(1024                   * sizeof(float));
     return g_x && g_kbuf && g_vbuf && g_xnorm && g_qkv_out &&
            g_attn_out && g_proj_out && g_att && g_mlp_gate &&
            g_mlp_up && g_mlp_hidden && g_mlp_out && g_logits;

@@ -333,7 +333,7 @@ class Transformer (nn .Module ):
         return logits ,loss 
     @torch .no_grad ()
 
-    def generate (self ,idx ,max_new_tokens ,temp =temperature ,top_k =1 ,rep_penalty =1.05 ):
+    def generate (self ,idx ,max_new_tokens ,temp =temperature ,top_k =1 ,rep_penalty =1.0 ):
         prompt_len =len (decode (idx [0 ].tolist ()))
         for _ in range (max_new_tokens ):
             idx_cond =idx [:,-block_size :]
@@ -459,19 +459,23 @@ def load_model ():
     train ()
     load_model ()
 
-conversation_history =""
+conversation_history ="User: hi\n Bot:Hello"
 def generate_reply (max_token_length ):
     global conversation_history 
     user_input =input ("User: ")
     if not user_input .strip ():
         return 
     user_input =user_input .strip ().lower ()
-    conversation_history +=f"User: {user_input }\nBot: "
-    if len (conversation_history )>1000 :
-        conversation_history =conversation_history [-1000 :]
+    conversation_history +=f"User: {user_input }\nBot:"
+    while len(conversation_history) > 1000:
+        idx = conversation_history.find('\n')
+        if idx == -1:
+            conversation_history = conversation_history[-1000:]
+            break
+        conversation_history = conversation_history[idx+1:]
     model .to ("cpu")
     context =encode (conversation_history ).unsqueeze (0 ).to ("cpu")
-    print ("Bot: ",end ="",flush =True )
+    print ("Bot:",end ="",flush =True )
     prompt_len =len (decode (context [0 ].tolist ()))
     output_ids =model .generate (context ,max_new_tokens =max_token_length )
     full_output =decode (output_ids [0 ].tolist ())
