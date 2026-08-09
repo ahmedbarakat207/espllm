@@ -127,9 +127,9 @@ The inference engine avoids heap fragmentation by allocating a single static or 
 #### ESP32 Target ($CTX=48, N_{embd}=128, N_{layer}=6$)
 | Allocation Target | Dimension / Calculation | Bytes |
 |---|---|---|
-| Key Cache (`g_kbuf`) | $6\text{ layers} \times 48\text{ ctx} \times 1\text{ kv\_head} \times 32\text{ dim} \times 4\text{ B}$ | 36,864 |
-| Value Cache (`g_vbuf`) | $6\text{ layers} \times 48\text{ ctx} \times 1\text{ kv\_head} \times 32\text{ dim} \times 4\text{ B}$ | 36,864 |
-| Vocabulary Logits (`g_logits`) | $1,024\text{ tokens} \times 4\text{ B}$ | 4,096 |
+| Key Cache (`g_kbuf`) | $6 \times 48 \times 1 \times 32 \times 4\text{ B}$ (6 layers, 48 ctx, 1 KV head, 32 dim) | 36,864 |
+| Value Cache (`g_vbuf`) | $6 \times 48 \times 1 \times 32 \times 4\text{ B}$ (6 layers, 48 ctx, 1 KV head, 32 dim) | 36,864 |
+| Vocabulary Logits (`g_logits`) | $1024 \times 4\text{ B}$ (1024 vocabulary tokens) | 4,096 |
 | QKV Projection Buffer (`g_qkv_out`) | $(128 + 2 \times 32) \times 4\text{ B}$ | 768 |
 | Hidden State Vector (`g_x`) | $128 \times 4\text{ B}$ | 512 |
 | Normalized State (`g_xnorm`) | $128 \times 4\text{ B}$ | 512 |
@@ -145,9 +145,9 @@ The inference engine avoids heap fragmentation by allocating a single static or 
 #### ESP8266 Target ($CTX=32, N_{embd}=64, N_{layer}=4$)
 | Allocation Target | Dimension / Calculation | Bytes |
 |---|---|---|
-| Key Cache (`g_kbuf`) | $4\text{ layers} \times 32\text{ ctx} \times 1\text{ kv\_head} \times 32\text{ dim} \times 4\text{ B}$ | 16,384 |
-| Value Cache (`g_vbuf`) | $4\text{ layers} \times 32\text{ ctx} \times 1\text{ kv\_head} \times 32\text{ dim} \times 4\text{ B}$ | 16,384 |
-| Vocabulary Logits (`g_logits`) | $1,024\text{ tokens} \times 4\text{ B}$ | 4,096 |
+| Key Cache (`g_kbuf`) | $4 \times 32 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 32 ctx, 1 KV head, 32 dim) | 16,384 |
+| Value Cache (`g_vbuf`) | $4 \times 32 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 32 ctx, 1 KV head, 32 dim) | 16,384 |
+| Vocabulary Logits (`g_logits`) | $1024 \times 4\text{ B}$ (1024 vocabulary tokens) | 4,096 |
 | Intermediate Activation Buffers | Sum of activation vectors | 1,680 |
 | **Total Arena Footprint** | **Static BSS Buffer (Zero Heap Allocation)** | **38,544 B (~37.6 KB)** |
 
@@ -178,7 +178,7 @@ Before triggering transformer prefill, user input is passed through an integrate
 * **Temperature Scaling**: Logits are scaled by temperature ($T = 0.5$) before softmax and cumulative distribution function (CDF) sampling:
   $$P(v_i) = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
 * **Recency-Weighted Repetition Penalty**: Recent token IDs within a sliding window of the last 20 generated tokens receive a direct logit subtraction:
-  $$z_k \leftarrow z_k - 1.6 \quad (\forall k \in \text{recent\_ids})$$
+  $$z_k \leftarrow z_k - 1.6 \quad (\forall k \in \mathcal{W}_{\text{recent}})$$
 * **Turn Termination**: Generation terminates upon producing token ID `0` (`<|endoftext|>`), a newline token, or reaching `MAX_GEN_TOKENS`.
 
 ## 6. Build, Flash & Interface Workflow
