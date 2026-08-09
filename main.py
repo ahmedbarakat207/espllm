@@ -7,33 +7,68 @@ from torch .optim .lr_scheduler import CosineAnnealingLR
 
 if torch .cuda .is_available ():
     device ="cuda"
-elif torch .backends .mps .is_available ():
+elif torch.backends.mps.is_available ():
     device ="mps"
 else :
     device ="cpu"
     
-checkpoint ="./model/model.pt"
-block_size =128 
-batch_size =32 
-n_layer =6 
-n_head =4 
-n_kv_head =1 
-n_embd =128 
-n_experts =16 
-moe_hidden =128 
-dropout =0.25 
-max_iters =20000 
-eval_interval =100 
-lr =2e-3 
-lr_min =1e-5 
-warmup_iters =300 
-eval_iters =10 
-generate_tokens =400 
-temperature =0.6 
-start_iter =0 
-patience =10 
-label_smoothing =0.0 
-qat_group_size =64 
+import sys
+
+TARGET = "esp8266"
+for arg in sys.argv:
+    if arg.startswith("--target="):
+        TARGET = arg.split("=")[1].strip()
+    elif arg in ("--esp8266", "-esp8266"):
+        TARGET = "esp8266"
+    elif arg in ("--esp32", "-esp32"):
+        TARGET = "esp32"
+
+if TARGET == "esp8266":
+    checkpoint = "./model/model_esp8266.pt"
+    block_size = 64
+    batch_size = 32
+    n_layer = 4
+    n_head = 2
+    n_kv_head = 1
+    n_embd = 64
+    n_experts = 20
+    moe_hidden = 64
+    dropout = 0.2
+    max_iters = 10000
+    eval_interval = 100
+    lr = 2e-3
+    lr_min = 1e-5
+    warmup_iters = 200
+    eval_iters = 10
+    generate_tokens = 200
+    temperature = 0.6
+    start_iter = 0
+    patience = 10
+    label_smoothing = 0.0
+    qat_group_size = 64
+else:
+    checkpoint = "./model/model_esp32.pt"
+    block_size = 128
+    batch_size = 32
+    n_layer = 6
+    n_head = 4
+    n_kv_head = 1
+    n_embd = 128
+    n_experts = 16
+    moe_hidden = 128
+    dropout = 0.25
+    max_iters = 20000
+    eval_interval = 100
+    lr = 2e-3
+    lr_min = 1e-5
+    warmup_iters = 300
+    eval_iters = 10
+    generate_tokens = 400
+    temperature = 0.6
+    start_iter = 0
+    patience = 10
+    label_smoothing = 0.0
+    qat_group_size = 64
 
 torch .manual_seed (1337 )
 
@@ -401,7 +436,7 @@ def train ():
                 best_val_loss =losses ["val"]
                 patience_counter =0 
                 torch .save (model .state_dict (),checkpoint +".best")
-                print (f"  ✓ new best ({best_val_loss :.4f}) saved")
+                print(f"  * new best ({best_val_loss:.4f}) saved")
             else :
                 patience_counter +=1 
                 if patience_counter >=patience :

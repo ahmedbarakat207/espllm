@@ -3,3 +3,4 @@ __pycache__/
 .pio/
 .vscode/
 compile_commands.js
+model/

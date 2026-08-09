@@ -1,29 +1,36 @@
 #include <Arduino.h>
 #include <string.h>
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+#  include <ESP8266WiFi.h>
+#endif
 #include "inference.hpp"
 #include "model_weights.hpp"
 
-static constexpr int N_EMBD          = 128;
-static constexpr int N_HEAD          = 4;
-static constexpr int N_KV_HEAD       = 1;
-static constexpr int N_LAYER         = 6;
+static constexpr int N_EMBD          = model_n_embd;
+static constexpr int N_HEAD          = model_n_head;
+static constexpr int N_KV_HEAD       = model_n_kv_head;
+static constexpr int N_LAYER         = model_n_layer;
 static constexpr int HEAD_DIM        = N_EMBD / N_HEAD;  
-static constexpr int MLP_HIDDEN      = 128;              
-static constexpr int N_EXPERTS       = 16;                
-static constexpr int GRP             = 64;                
+static constexpr int MLP_HIDDEN      = model_mlp_hidden;              
+static constexpr int N_EXPERTS       = model_n_experts;                
+static constexpr int GRP             = model_group_size;                
 #if defined(ESP8266) || defined(ESP8266_BOARD)
-static constexpr int INFER_CTX       = 24;                
-static constexpr int MAX_GEN_TOKENS  = 50;
-static constexpr float TEMPERATURE   = 0.0f;
-static constexpr size_t ARENA_SIZE   = 46 * 1024;
+static constexpr int INFER_CTX       = 32;                
+static constexpr int MAX_GEN_TOKENS  = 60;
+static constexpr float TEMPERATURE   = 0.5f;
+static constexpr size_t ARENA_SIZE   = 40 * 1024;
+
+static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
+static MemoryArena s_arena(s_arena_mem, ARENA_SIZE);
+static MemoryArena* arena = &s_arena;
 #else
 static constexpr int INFER_CTX       = 48;                
 static constexpr int MAX_GEN_TOKENS  = 80;
-static constexpr float TEMPERATURE   = 0.0f;
+static constexpr float TEMPERATURE   = 0.5f;
 static constexpr size_t ARENA_SIZE   = 88 * 1024;
+static MemoryArena* arena = nullptr;
 #endif
 
-static MemoryArena* arena = nullptr;
 static float* g_x;          
 static float* g_kbuf;       
 static float* g_vbuf;       
@@ -40,40 +47,6 @@ static float* g_logits;
 static uint16_t ctx_ids[INFER_CTX];
 static int     ctx_len = 0;
 static int     ctx_pos = 0;
-
-struct LayerW {
-    const uint8_t* qkv_w;  const float* qkv_s;  const float* qkv_z;
-    const uint8_t* proj_w; const float* proj_s; const float* proj_z;
-    const float* router_w;
-    const uint8_t* experts_gate_q;
-    const float*   experts_gate_s;
-    const float*   experts_gate_z;
-    const uint8_t* experts_up_q;
-    const float*   experts_up_s;
-    const float*   experts_up_z;
-    const uint8_t* experts_down_q;
-    const float*   experts_down_s;
-    const float*   experts_down_z;
-    const float* ln1_g;
-    const float* ln2_g;
-};
-
-#define LAYER_INIT(li) \
-    { \
-        l##li##_attn_qkv_weights,      l##li##_attn_qkv_scales,      l##li##_attn_qkv_zp, \
-        l##li##_attn_proj_weights,     l##li##_attn_proj_scales,     l##li##_attn_proj_zp, \
-        l##li##_router, \
-        l##li##_experts_gate_weights,  l##li##_experts_gate_scales,  l##li##_experts_gate_zp, \
-        l##li##_experts_up_weights,    l##li##_experts_up_scales,    l##li##_experts_up_zp, \
-        l##li##_experts_down_weights,  l##li##_experts_down_scales,  l##li##_experts_down_zp, \
-        l##li##_ln1_gamma, \
-        l##li##_ln2_gamma, \
-    }
-
-static const LayerW g_layers[N_LAYER] = {
-    LAYER_INIT(0), LAYER_INIT(1), LAYER_INIT(2),
-    LAYER_INIT(3), LAYER_INIT(4), LAYER_INIT(5),
-};
 
 static void transformer_forward(int token, int pos) {
     const float* emb = tok_emb + token * N_EMBD;
@@ -155,17 +128,17 @@ static bool print_token(int id) {
     return has_newline;
 }
 
+static int few_shot_len = 0;
+
 static void ctx_push(uint16_t id) {
     if (ctx_len >= INFER_CTX) {
-        memmove(ctx_ids, ctx_ids + 1, (INFER_CTX - 1) * sizeof(uint16_t));
-        ctx_len = INFER_CTX - 1;
-        for (int l = 0; l < N_LAYER; ++l) {
-            float* layer_kbuf = g_kbuf + l * (INFER_CTX * N_KV_HEAD * HEAD_DIM);
-            float* layer_vbuf = g_vbuf + l * (INFER_CTX * N_KV_HEAD * HEAD_DIM);
-            memmove(layer_kbuf, layer_kbuf + (N_KV_HEAD * HEAD_DIM), (INFER_CTX - 1) * (N_KV_HEAD * HEAD_DIM) * sizeof(float));
-            memmove(layer_vbuf, layer_vbuf + (N_KV_HEAD * HEAD_DIM), (INFER_CTX - 1) * (N_KV_HEAD * HEAD_DIM) * sizeof(float));
+        int evict_idx = (few_shot_len < INFER_CTX - 2) ? few_shot_len : 0;
+        int shift_count = (INFER_CTX - 1) - evict_idx;
+        if (shift_count > 0) {
+            memmove(ctx_ids + evict_idx, ctx_ids + evict_idx + 1, shift_count * sizeof(uint16_t));
         }
-        if (ctx_pos > ctx_len) ctx_pos = ctx_len;
+        ctx_len = INFER_CTX - 1;
+        if (ctx_pos > evict_idx) ctx_pos = evict_idx;
     }
     ctx_ids[ctx_len++] = id;
 }
@@ -207,12 +180,13 @@ static int sample_next(float temp) {
     while (ctx_pos < ctx_len) {
         transformer_forward(ctx_ids[ctx_pos], ctx_pos);
         ctx_pos++;
+        llm_optimistic_yield(1);
     }
-    for (int c = 0; c < ctx_len; ++c) {
+    int rep_window = (ctx_len < 20) ? ctx_len : 20;
+    for (int c = ctx_len - rep_window; c < ctx_len; ++c) {
         uint16_t id = ctx_ids[c];
         if (id < model_vocab_size) {
-            if (g_logits[id] > 0.0f) g_logits[id] /= 1.15f;
-            else g_logits[id] *= 1.15f;
+            g_logits[id] -= 1.6f;
         }
     }
     if (temp <= 0.0f) return argmax(g_logits, (int)model_vocab_size);
@@ -231,10 +205,166 @@ static int sample_next(float temp) {
     return model_vocab_size - 1;
 }
 
+static const char* skip_ws(const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static bool parse_math_expr(const char*& p, double& val, int& op_count);
+
+static bool parse_math_factor(const char*& p, double& val, int& op_count) {
+    p = skip_ws(p);
+    if (*p == '+') { p++; return parse_math_factor(p, val, op_count); }
+    if (*p == '-') {
+        p++;
+        double sub = 0.0;
+        if (!parse_math_factor(p, sub, op_count)) return false;
+        val = -sub;
+        return true;
+    }
+    if (*p == '(') {
+        p++;
+        if (!parse_math_expr(p, val, op_count)) return false;
+        p = skip_ws(p);
+        if (*p != ')') return false;
+        p++;
+        return true;
+    }
+    char* endp = nullptr;
+    val = strtod(p, &endp);
+    if (endp == p) return false;
+    p = endp;
+
+    p = skip_ws(p);
+    if (*p == '^') {
+        p++;
+        op_count++;
+        double exp = 0.0;
+        if (!parse_math_factor(p, exp, op_count)) return false;
+        val = pow(val, exp);
+    }
+    return true;
+}
+
+static bool parse_math_term(const char*& p, double& val, int& op_count) {
+    if (!parse_math_factor(p, val, op_count)) return false;
+    while (true) {
+        p = skip_ws(p);
+        char op = *p;
+        if (op == '*' || op == '/' || op == '%') {
+            p++;
+            op_count++;
+            double rhs = 0.0;
+            if (!parse_math_factor(p, rhs, op_count)) return false;
+            if (op == '*') val *= rhs;
+            else if (op == '/') {
+                if (fabs(rhs) < 1e-12) return false;
+                val /= rhs;
+            }
+            else if (op == '%') {
+                if (fabs(rhs) < 1e-12) return false;
+                val = fmod(val, rhs);
+            }
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool parse_math_expr(const char*& p, double& val, int& op_count) {
+    if (!parse_math_term(p, val, op_count)) return false;
+    while (true) {
+        p = skip_ws(p);
+        char op = *p;
+        if (op == '+' || op == '-') {
+            p++;
+            op_count++;
+            double rhs = 0.0;
+            if (!parse_math_term(p, rhs, op_count)) return false;
+            if (op == '+') val += rhs;
+            else val -= rhs;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool try_evaluate_math(const char* raw_input, char* output, size_t out_len) {
+    if (!raw_input || !*raw_input) return false;
+
+    char clean[128];
+    size_t in_len = strlen(raw_input);
+    if (in_len >= sizeof(clean)) in_len = sizeof(clean) - 1;
+    memcpy(clean, raw_input, in_len);
+    clean[in_len] = '\0';
+
+    char lower[128];
+    for (size_t i = 0; i <= in_len; ++i) {
+        lower[i] = (char)tolower((unsigned char)clean[i]);
+    }
+
+    const char* start_ptr = clean;
+    const char* lower_ptr = lower;
+
+    const char* prefixes[] = {
+        "what is", "what's", "whats", "calculate", "calc", "solve",
+        "how much is", "evaluate", "compute", "tell me", "please calculate", "math:"
+    };
+    for (size_t k = 0; k < sizeof(prefixes)/sizeof(prefixes[0]); ++k) {
+        const char* pfx = prefixes[k];
+        size_t plen = strlen(pfx);
+        if (strncmp(lower_ptr, pfx, plen) == 0) {
+            start_ptr += plen;
+            lower_ptr += plen;
+            break;
+        }
+    }
+
+    while (*start_ptr == ' ' || *start_ptr == ':' || *start_ptr == '\t') {
+        start_ptr++;
+    }
+
+    char expr_buf[128];
+    size_t elen = strlen(start_ptr);
+    if (elen >= sizeof(expr_buf)) elen = sizeof(expr_buf) - 1;
+    memcpy(expr_buf, start_ptr, elen);
+    expr_buf[elen] = '\0';
+
+    while (elen > 0 && (expr_buf[elen - 1] == '?' || expr_buf[elen - 1] == '=' ||
+                        expr_buf[elen - 1] == ' ' || expr_buf[elen - 1] == '.' ||
+                        expr_buf[elen - 1] == '!' || expr_buf[elen - 1] == '\r' ||
+                        expr_buf[elen - 1] == '\n')) {
+        expr_buf[--elen] = '\0';
+    }
+
+    if (elen == 0) return false;
+
+    const char* p = expr_buf;
+    double result = 0.0;
+    int op_count = 0;
+    if (!parse_math_expr(p, result, op_count)) return false;
+
+    p = skip_ws(p);
+    if (*p != '\0') return false; // Contains trailing non-math characters
+
+    if (op_count == 0) return false; // Must contain at least one operator (+, -, *, /, %, ^)
+
+    if (fabs(result - round(result)) < 1e-7 && fabs(result) < 1e14) {
+        snprintf(output, out_len, "%lld", (long long)round(result));
+    } else {
+        snprintf(output, out_len, "%.6g", result);
+    }
+    return true;
+}
+
 static void init_few_shot() {
     ctx_len = 0;
     ctx_pos = 0;
+    few_shot_len = 0;
     ctx_push_str("User: hi\nBot: Hello\n");
+    few_shot_len = ctx_len;
 }
 
 static void run_chat() {
@@ -262,21 +392,35 @@ static void run_chat() {
         init_few_shot();
     }
 
+    char math_response[64];
+    if (try_evaluate_math(input, math_response, sizeof(math_response))) {
+        Serial.print("Bot: ");
+        Serial.println(math_response);
+        Serial.println("[0 ms - Math Harness]");
+        
+        char turn[INFER_CTX * 2];
+        snprintf(turn, sizeof(turn), "User: %s\nBot: %s\n", input, math_response);
+        ctx_push_str(turn);
+        return;
+    }
+
     char prompt[INFER_CTX * 2];
     snprintf(prompt, sizeof(prompt), "User: %s\nBot:", input);
     ctx_push_str(prompt);
     Serial.print("Bot: ");
     unsigned long t_start = millis();
     for (int i = 0; i < MAX_GEN_TOKENS; ++i) {
-        unsigned long step_t = micros();
+        llm_optimistic_yield(1);
         int next_id  = sample_next(TEMPERATURE);
         if (next_id == 0) break; 
         bool hit_newline = print_token(next_id);
         ctx_push((uint16_t)next_id);
-        if (hit_newline && i > 3) break;
-        yield();
+        if (hit_newline && i > 1) break;
+        llm_optimistic_yield(1);
     }
-    ctx_push_str("\n");
+    if (ctx_len == 0 || ctx_ids[ctx_len - 1] != 199) { 
+        ctx_push_str("\n");
+    }
     unsigned long elapsed = millis() - t_start;
     Serial.println();
     Serial.printf("[%lu ms total]\n", elapsed);
@@ -293,6 +437,7 @@ static void print_model_info() {
 }
 
 static bool alloc_buffers() {
+    arena->reset();
     g_x          = (float*)arena->alloc(N_EMBD                 * sizeof(float));
     g_kbuf       = (float*)arena->alloc(N_LAYER * INFER_CTX * N_KV_HEAD * HEAD_DIM * sizeof(float));
     g_vbuf       = (float*)arena->alloc(N_LAYER * INFER_CTX * N_KV_HEAD * HEAD_DIM * sizeof(float));
@@ -305,7 +450,7 @@ static bool alloc_buffers() {
     g_mlp_up     = (float*)arena->alloc(MLP_HIDDEN             * sizeof(float));
     g_mlp_hidden = (float*)arena->alloc(MLP_HIDDEN             * sizeof(float));
     g_mlp_out    = (float*)arena->alloc(N_EMBD                 * sizeof(float));
-    g_logits     = (float*)arena->alloc(1024                   * sizeof(float));
+    g_logits     = (float*)arena->alloc(model_vocab_size       * sizeof(float));
     return g_x && g_kbuf && g_vbuf && g_xnorm && g_qkv_out &&
            g_attn_out && g_proj_out && g_att && g_mlp_gate &&
            g_mlp_up && g_mlp_hidden && g_mlp_out && g_logits;
@@ -314,6 +459,19 @@ static bool alloc_buffers() {
 void setup() {
     Serial.begin(115200);
     delay(2000);
+
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+    WiFi.mode(WIFI_OFF);
+    WiFi.forceSleepBegin();
+    delay(1);
+    ESP.wdtEnable(5000);
+    ESP.wdtFeed();
+#else
+    if (!arena) {
+        arena = new MemoryArena(ARENA_SIZE);
+    }
+#endif
+
     Serial.println("\n╔══════════════════════════╗");
     Serial.println("║      ESP-LLM  v1.0       ║");
 #if defined(ESP8266) || defined(ESP8266_BOARD)
@@ -322,22 +480,18 @@ void setup() {
     Serial.println("║  INT4 Chatbot on ESP32   ║");
 #endif
     Serial.println("╚══════════════════════════╝");
-    Serial.printf("Free heap: %u B\n", (unsigned)ESP.getFreeHeap());
-    arena = new MemoryArena(ARENA_SIZE);
-    if (!arena->is_valid()) {
-        Serial.printf("[FAIL] Arena alloc failed (need %u KB, free %u B)\n",
-                      ARENA_SIZE / 1024, (unsigned)ESP.getFreeHeap());
+    Serial.printf("Free heap at boot (Wi-Fi OFF): %u B\n", (unsigned)ESP.getFreeHeap());
+
+    if (!arena || !arena->is_valid() || !alloc_buffers()) {
+        Serial.printf("[FAIL] Memory arena allocation failed (need %u KB, free %u B)\n",
+                      (unsigned)(ARENA_SIZE / 1024), (unsigned)ESP.getFreeHeap());
         return;
     }
-    Serial.printf("[OK] Arena: %u KB allocated\n", ARENA_SIZE / 1024);
-    if (!alloc_buffers()) {
-        Serial.println("[FAIL] Working buffer alloc failed");
-        return;
-    }
-    Serial.printf("[OK] Buffers: %u / %u B used\n",
+    Serial.printf("[OK] Memory Arena: %u KB (%u / %u B mapped)\n",
+                  (unsigned)(ARENA_SIZE / 1024),
                   (unsigned)arena->used(), (unsigned)arena->capacity());
     print_model_info();
-    Serial.printf("Free heap after init: %u B\n\n", (unsigned)ESP.getFreeHeap());
+    Serial.printf("Free heap remaining: %u B\n\n", (unsigned)ESP.getFreeHeap());
     init_few_shot();
     Serial.println("Type your message and press Enter.");
     Serial.println("──────────────────────────────────");

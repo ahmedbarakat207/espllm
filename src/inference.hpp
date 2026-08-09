@@ -11,13 +11,25 @@ private:
     uint8_t* buffer;
     size_t   cap;
     size_t   offset;
+    bool     owns_memory;
 public:
-    explicit MemoryArena(size_t total_size) {
-        buffer = (uint8_t*)malloc(total_size);
-        cap    = total_size;
-        offset = 0;
+    // Static buffer constructor - zero dynamic heap allocations
+    MemoryArena(uint8_t* static_buf, size_t total_size) {
+        buffer      = static_buf;
+        cap         = total_size;
+        offset      = 0;
+        owns_memory = false;
     }
-    ~MemoryArena() { if (buffer) free(buffer); }
+    // Dynamic buffer constructor (fallback)
+    explicit MemoryArena(size_t total_size) {
+        buffer      = (uint8_t*)malloc(total_size);
+        cap         = total_size;
+        offset      = 0;
+        owns_memory = true;
+    }
+    ~MemoryArena() {
+        if (owns_memory && buffer) free(buffer);
+    }
     void* alloc(size_t sz) {
         sz = (sz + 3u) & ~3u;
         if (offset + sz > cap) return nullptr;
@@ -31,6 +43,30 @@ public:
     size_t capacity()    const { return cap; }
     size_t remaining()   const { return cap - offset; }
 };
+
+#if defined(ESP8266) || defined(ESP8266_BOARD)
+#include <Arduino.h>
+static inline void llm_optimistic_yield(uint32_t every_n_ops = 256) {
+    static uint32_t counter = 0;
+    if (++counter >= every_n_ops) {
+        counter = 0;
+        ESP.wdtFeed();
+        optimistic_yield(1000);
+        yield();
+    }
+}
+#elif defined(ESP32)
+#include <Arduino.h>
+static inline void llm_optimistic_yield(uint32_t every_n_ops = 512) {
+    static uint32_t counter = 0;
+    if (++counter >= every_n_ops) {
+        counter = 0;
+        yield();
+    }
+}
+#else
+static inline void llm_optimistic_yield(uint32_t every_n_ops = 1000) {}
+#endif
 
 static inline float dot_f32(const float* a, const float* b, int n) {
     float s = 0.0f;
@@ -63,12 +99,13 @@ void matmul_int4_f32(
 ) {
     const int n_groups = (in_features + group_size - 1) / group_size;
     const int k_bytes  = (in_features + 1) / 2;
+    init_unpack_lut();
     for (int i = 0; i < out_features; ++i) {
+        llm_optimistic_yield(64);
         float acc = 0.0f;
         const uint8_t* w_row = W_packed + (size_t)i * k_bytes;
         const float*   s_row = scales   + (size_t)i * n_groups;
         const float*   z_row = zp       + (size_t)i * n_groups;
-        init_unpack_lut();
         for (int j = 0; j < k_bytes; j += 4) {
             uint8_t p0 = w_row[j];
             uint8_t p1 = w_row[j+1];
