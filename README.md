@@ -113,13 +113,27 @@ for (int j = 0; j < k_bytes; j += 4) {
 The inference engine avoids heap fragmentation by allocating a single static or startup arena (`MemoryArena`). All tensor activation buffers are sliced contiguously:
 
 ```
-+-----------------------------------------------------------------------------------------+
-| g_x (512B) | g_kbuf (36KB) | g_vbuf (36KB) | g_xnorm (512B) | g_qkv_out (768B)          |
-+-----------------------------------------------------------------------------------------+
-| g_attn_out (512B) | g_proj_out (512B) | g_att (192B) | g_mlp_gate (512B) | g_mlp_up ... |
-+-----------------------------------------------------------------------------------------+
-| g_mlp_hidden (512B) | g_mlp_out (512B) | g_logits (4096B)                               |
-+-----------------------------------------------------------------------------------------+
++-------------------------------------------------------------+
+| MemoryArena Pool (88 KB on ESP32 / 40 KB on ESP8266)        |
++-------------------------------------------------------------+
+| Offset | Tensor Buffer | Size   | Description               |
++--------+---------------+--------+---------------------------+
+| 0x0000 | g_x           | 512 B  | Token hidden state vector |
+| 0x0200 | g_kbuf        | 36 KB  | Multi-layer Key cache     |
+| 0x9200 | g_vbuf        | 36 KB  | Multi-layer Value cache   |
+| 0x12200| g_xnorm       | 512 B  | RMSNorm normalized vector |
+| 0x12400| g_qkv_out     | 768 B  | Fused QKV projection      |
+| 0x12700| g_attn_out    | 512 B  | Multi-head accumulator    |
+| 0x12900| g_proj_out    | 512 B  | Attention dense output    |
+| 0x12B00| g_att         | 192 B  | Attention softmax scores  |
+| 0x12BC0| g_mlp_gate    | 512 B  | Active expert gate        |
+| 0x12DC0| g_mlp_up      | 512 B  | Active expert up          |
+| 0x12FC0| g_mlp_hidden  | 512 B  | SwiGLU activation vector  |
+| 0x131C0| g_mlp_out     | 512 B  | Expert down projection    |
+| 0x133C0| g_logits      | 4 KB   | Output vocabulary logits  |
++-------------------------------------------------------------+
+| Headroom: ~5.1 KB reserved for alignment and safety buffer  |
++-------------------------------------------------------------+
 ```
 
 ### 4.2 SRAM Allocation Matrix
