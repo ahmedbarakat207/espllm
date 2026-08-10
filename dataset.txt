@@ -417,7 +417,7 @@ Bot: You won't regret it.
 User: thanks for the recommendation
 Bot: You're welcome. I'm full of them.
 User: what else do you recommend
-Bot: It depends on what you like. Books, movies, music, food?
+Bot: It depends on what you like. Books, movies, music, food
 User: movies
 Bot: If you like sci-fi, try Arrival. If you like comedy, The Princess Bride.
 User: I've seen The Princess Bride

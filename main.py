@@ -33,7 +33,7 @@ if TARGET == "esp8266":
     n_embd = 64
     n_experts = 20
     moe_hidden = 64
-    dropout = 0.2
+    dropout = 0.0
     max_iters = 10000
     eval_interval = 100
     lr = 2e-3
@@ -43,7 +43,7 @@ if TARGET == "esp8266":
     generate_tokens = 200
     temperature = 0.6
     start_iter = 0
-    patience = 10
+    patience = 1000
     label_smoothing = 0.0
     qat_group_size = 64
 else:
@@ -56,7 +56,7 @@ else:
     n_embd = 128
     n_experts = 16
     moe_hidden = 128
-    dropout = 0.25
+    dropout = 0.0
     max_iters = 20000
     eval_interval = 100
     lr = 2e-3
@@ -72,8 +72,18 @@ else:
 
 torch .manual_seed (1337 )
 
-dataset =open ("dataset.txt","r+")
-text =dataset .read ()
+dataset_path = "dataset.txt"
+qa_pairs = []
+with open(dataset_path, "r") as f:
+    current_q, current_a = "", ""
+    for line in f:
+        if line.startswith("User:"):
+            if current_q: qa_pairs.append(current_q + current_a)
+            current_q = line
+            current_a = ""
+        else:
+            current_a += line
+    if current_q: qa_pairs.append(current_q + current_a)
 
 tokenizer =ByteLevelBPETokenizer (
 "bpe-vocab.json",
@@ -84,22 +94,41 @@ vocab_size =tokenizer .get_vocab_size ()
 print (f"BPE Vocab Size: {vocab_size }")
 encode =lambda s :torch .tensor (tokenizer .encode (s ).ids ,dtype =torch .long )
 decode =lambda t :tokenizer .decode (t .tolist ()if hasattr (t ,'tolist')else t )
-data =encode (text )
-n =int (0.9 *len (data ))
-train_data ,val_data =data [:n ],data [n :]
 
-def get_batch (split ):
-    d =train_data if split =="train"else val_data 
-    cur_block =min (block_size ,max (2 ,len (d )-2 ))
-    hi =len (d )-cur_block -1 
-    if hi <=0 :
-        x =d [:cur_block ].unsqueeze (0 )
-        y =d [1 :cur_block +1 ].unsqueeze (0 )
-        return x .to (device ),y .to (device )
-    ix =torch .randint (hi ,(batch_size ,))
-    x =torch .stack ([d [i :i +cur_block ]for i in ix ])
-    y =torch .stack ([d [i +1 :i +cur_block +1 ]for i in ix ])
-    return x .to (device ),y .to (device )
+import random
+random.seed(1337)
+random.shuffle(qa_pairs)
+data = [encode(qa) for qa in qa_pairs]
+
+n = int(0.9 * len(data))
+train_data, val_data = data[:n], data[n:]
+
+def get_batch(split):
+    dataset = train_data if split == "train" else val_data
+    x_batch = []
+    y_batch = []
+    for _ in range(batch_size):
+        idx = random.randint(0, len(dataset)-1)
+        seq = dataset[idx]
+        if len(seq) > block_size + 1:
+            seq = seq[:block_size+1]
+        x_seq = seq[:-1]
+        y_seq = seq[1:]
+        
+        pad_len = block_size - len(x_seq)
+        if pad_len > 0:
+            x_pad = torch.cat([x_seq, torch.zeros(pad_len, dtype=torch.long)])
+            y_pad = torch.cat([y_seq, torch.full((pad_len,), -100, dtype=torch.long)])
+        else:
+            x_pad = x_seq
+            y_pad = y_seq
+            
+        x_batch.append(x_pad)
+        y_batch.append(y_pad)
+        
+    x = torch.stack(x_batch).to(device)
+    y = torch.stack(y_batch).to(device)
+    return x, y
 
 def _int4_pack (q :torch .Tensor )->torch .Tensor :
     out ,n =q .shape 
@@ -452,10 +481,10 @@ def train ():
             scheduler .step ()
     torch .save (model .state_dict (),checkpoint )
     print ("Full-precision model saved to",checkpoint )
-    if os .path .isfile (checkpoint +".best"):
-        model .load_state_dict (torch .load (checkpoint +".best",map_location =device ))
-        model .eval ()
-        print ("Loaded best checkpoint for quantization.")
+    # if os .path .isfile (checkpoint +".best"):
+    #     model .load_state_dict (torch .load (checkpoint +".best",map_location =device ))
+    #     model .eval ()
+    #     print ("Loaded best checkpoint for quantization.")
     q_model =convert_to_int4 (deepcopy (model ))
     with gzip .open (checkpoint +".quantized","wb")as f :
         torch .save (q_model ,f )
@@ -494,14 +523,21 @@ def load_model ():
     train ()
     load_model ()
 
-conversation_history ="User: hi\n Bot:Hello"
+conversation_history = "User: hi\nBot: Hello! How can I help you today?\n"
 def generate_reply (max_token_length ):
-    global conversation_history 
+    global conversation_history
+    conversation_history = ""
     user_input =input ("User: ")
     if not user_input .strip ():
         return 
-    user_input =user_input .strip ().lower ()
-    conversation_history +=f"User: {user_input }\nBot:"
+    user_input = user_input.strip()
+    clean_input = user_input.lower().strip("?!.")
+    if clean_input.startswith("i'm"): 
+        clean_input = "I'm" + clean_input[3:]
+    elif clean_input.startswith("i "):
+        clean_input = "I " + clean_input[2:]
+    
+    conversation_history += f"User: {clean_input}\nBot:"
     while len(conversation_history) > 1000:
         idx = conversation_history.find('\n')
         if idx == -1:
@@ -524,7 +560,7 @@ if __name__ =="__main__":
     import sys 
     force_train ="--train"in sys .argv 
     model =Transformer (group_size =qat_group_size ).to (device )
-    optimizer =torch .optim .AdamW (model .parameters (),lr =lr ,weight_decay =0.05 )
+    optimizer =torch .optim .AdamW (model .parameters (),lr =lr ,weight_decay =0.0 )
     if force_train :
         print ("Forcing training from scratch...")
         train ()

@@ -17,7 +17,7 @@ static constexpr int GRP             = model_group_size;
 #if defined(ESP8266) || defined(ESP8266_BOARD)
 static constexpr int INFER_CTX       = 32;                
 static constexpr int MAX_GEN_TOKENS  = 60;
-static constexpr float TEMPERATURE   = 0.5f;
+static constexpr float TEMPERATURE   = 0.0f;
 static constexpr size_t ARENA_SIZE   = 40 * 1024;
 
 static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
@@ -26,7 +26,7 @@ static MemoryArena* arena = &s_arena;
 #else
 static constexpr int INFER_CTX       = 48;                
 static constexpr int MAX_GEN_TOKENS  = 80;
-static constexpr float TEMPERATURE   = 0.5f;
+static constexpr float TEMPERATURE   = 0.0f;
 static constexpr size_t ARENA_SIZE   = 88 * 1024;
 static MemoryArena* arena = nullptr;
 #endif
@@ -359,12 +359,9 @@ static bool try_evaluate_math(const char* raw_input, char* output, size_t out_le
     return true;
 }
 
-static void init_few_shot() {
+static void clear_context() {
     ctx_len = 0;
     ctx_pos = 0;
-    few_shot_len = 0;
-    ctx_push_str("User: hi\nBot: Hello\n");
-    few_shot_len = ctx_len;
 }
 
 static void run_chat() {
@@ -388,9 +385,7 @@ static void run_chat() {
     Serial.println();
     if (ilen == 0) return;
 
-    if (ctx_len == 0) {
-        init_few_shot();
-    }
+    clear_context();
 
     char math_response[64];
     if (try_evaluate_math(input, math_response, sizeof(math_response))) {
@@ -404,10 +399,30 @@ static void run_chat() {
         return;
     }
 
+    // Preprocess input: lowercase, strip punctuation, fix "i'm"
+    int len = strlen(input);
+    while (len > 0 && (input[len-1] == '?' || input[len-1] == '!' || input[len-1] == '.' || input[len-1] == ' ')) {
+        input[len-1] = '\0';
+        len--;
+    }
+    for (int i = 0; i < len; ++i) {
+        if (input[i] >= 'A' && input[i] <= 'Z') {
+            input[i] = input[i] + 32;
+        }
+    }
+    char clean_input[INFER_CTX * 2];
+    if (strncmp(input, "i'm", 3) == 0) {
+        snprintf(clean_input, sizeof(clean_input), "I'm%s", input + 3);
+    } else if (strncmp(input, "i ", 2) == 0) {
+        snprintf(clean_input, sizeof(clean_input), "I %s", input + 2);
+    } else {
+        snprintf(clean_input, sizeof(clean_input), "%s", input);
+    }
+
     char prompt[INFER_CTX * 2];
-    snprintf(prompt, sizeof(prompt), "User: %s\nBot:", input);
+    snprintf(prompt, sizeof(prompt), "User: %s\nBot:", clean_input);
     ctx_push_str(prompt);
-    Serial.print("Bot: ");
+    Serial.print("Bot:");
     unsigned long t_start = millis();
     for (int i = 0; i < MAX_GEN_TOKENS; ++i) {
         llm_optimistic_yield(1);
@@ -492,7 +507,7 @@ void setup() {
                   (unsigned)arena->used(), (unsigned)arena->capacity());
     print_model_info();
     Serial.printf("Free heap remaining: %u B\n\n", (unsigned)ESP.getFreeHeap());
-    init_few_shot();
+    clear_context();
     Serial.println("Type your message and press Enter.");
     Serial.println("──────────────────────────────────");
 }
