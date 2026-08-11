@@ -4,7 +4,7 @@ def main ():
     tokenizer =ByteLevelBPETokenizer ()
     tokenizer .train (
     files =["dataset.txt"],
-    vocab_size =1024 ,
+    vocab_size =2048 ,
     min_frequency =2 ,
     special_tokens =[
     "<|endoftext|>"

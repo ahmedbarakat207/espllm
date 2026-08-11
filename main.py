@@ -33,7 +33,7 @@ if TARGET == "esp8266":
     n_embd = 64
     n_experts = 20
     moe_hidden = 64
-    dropout = 0.0
+    dropout = 0.2
     max_iters = 10000
     eval_interval = 100
     lr = 2e-3
@@ -43,14 +43,14 @@ if TARGET == "esp8266":
     generate_tokens = 200
     temperature = 0.6
     start_iter = 0
-    patience = 1000
-    label_smoothing = 0.0
+    patience = 10
+    label_smoothing = 0.1
     qat_group_size = 64
 else:
     checkpoint = "./model/model_esp32.pt"
     block_size = 128
     batch_size = 32
-    n_layer = 6
+    n_layer = 7
     n_head = 4
     n_kv_head = 1
     n_embd = 128
@@ -130,109 +130,79 @@ def get_batch(split):
     y = torch.stack(y_batch).to(device)
     return x, y
 
-def _int4_pack (q :torch .Tensor )->torch .Tensor :
-    out ,n =q .shape 
-    if n %2 :
-        q =F .pad (q ,(0 ,1 ))
-        n +=1 
-    lo =q [:,0 ::2 ]&0x0F 
-    hi =(q [:,1 ::2 ]<<4 )&0xF0 
-    return (lo |hi ).to (torch .uint8 )
+class BitLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, group_size: int = 64):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-def quantize_tensor_int4 (w :torch .Tensor ,group_size :int =64 ):
-    out ,n =w .shape 
-    n_groups =math .ceil (n /group_size )
-    padded_n =n_groups *group_size 
-    if padded_n !=n :
-        w =F .pad (w ,(0 ,padded_n -n ))
-    wg =w .view (out ,n_groups ,group_size )
-    wmin =wg .min (dim =-1 ,keepdim =True ).values 
-    wmax =wg .max (dim =-1 ,keepdim =True ).values 
-    scale =(wmax -wmin )/15.0 
-    scale =torch .where (scale ==0 ,torch .ones_like (scale ),scale )
-    zp =torch .round (-wmin /scale )
-    q =torch .clamp (torch .round (wg /scale )+zp ,0 ,15 ).to (torch .uint8 )
-    q =q .view (out ,padded_n )[:,:n ]
-    return _int4_pack (q ),scale .squeeze (-1 ),zp .squeeze (-1 )
+    def _quantize_weight(self, w: torch.Tensor):
+        out, n = w.shape
+        n_groups = math.ceil(n / self.group_size)
+        padded_n = n_groups * self.group_size
+        w_pad = F.pad(w, (0, padded_n - n)) if padded_n != n else w
+        wg = w_pad.view(out, n_groups, self.group_size)
+        scale = wg.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+        w_q = torch.clamp(torch.round(wg / scale), -1, 1)
+        w_deq = (w_q * scale).view(out, padded_n)[:, :n]
+        return w + (w_deq - w).detach()
 
-def dequantize_tensor_int4 (q_packed :torch .Tensor ,scale :torch .Tensor ,
-zp :torch .Tensor ,n :int ,group_size :int =64 ):
-    m =q_packed .shape [1 ]
-    q =torch .empty (q_packed .shape [0 ],m *2 ,dtype =torch .uint8 ,device =q_packed .device )
-    q [:,0 ::2 ]=q_packed &0x0F 
-    q [:,1 ::2 ]=(q_packed >>4 )&0x0F 
-    q =q [:,:n ].float ()
-    groups =torch .arange (n ,device =q .device )//group_size 
-    return (q -zp .float ()[:,groups ])*scale .float ()[:,groups ]
+    def _quantize_activation(self, x: torch.Tensor):
+        scale = (x.abs().max(dim=-1, keepdim=True).values / 127.0).clamp(min=1e-5)
+        x_q = torch.clamp(torch.round(x / scale), -128, 127)
+        x_deq = x_q * scale
+        return x + (x_deq - x).detach()
 
-class QATLinear (nn .Module ):
-    def __init__ (self ,in_features :int ,out_features :int ,bias :bool =True ,
-    group_size :int =64 ):
-        super ().__init__ ()
-        self .in_features =in_features 
-        self .out_features =out_features 
-        self .group_size =group_size 
-        self .weight =nn .Parameter (torch .empty (out_features ,in_features ))
-        if bias :
-            self .bias =nn .Parameter (torch .zeros (out_features ))
-        else :
-            self .register_parameter ("bias",None )
-        nn .init .kaiming_uniform_ (self .weight ,a =math .sqrt (5 ))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w_fake = self._quantize_weight(self.weight)
+        x_fake = self._quantize_activation(x)
+        return F.linear(x_fake, w_fake, self.bias)
 
-    def _fake_quantize (self ,w :torch .Tensor )->torch .Tensor :
-        out ,n =w .shape 
-        n_groups =math .ceil (n /self .group_size )
-        padded_n =n_groups *self .group_size 
-        w_pad =F .pad (w ,(0 ,padded_n -n ))if padded_n !=n else w 
-        wg =w_pad .view (out ,n_groups ,self .group_size )
-        wmin =wg .min (dim =-1 ,keepdim =True ).values 
-        wmax =wg .max (dim =-1 ,keepdim =True ).values 
-        scale =(wmax -wmin )/15.0 
-        scale =torch .where (scale ==0 ,torch .ones_like (scale ),scale )
-        zp =torch .round (-wmin /scale )
-        q =torch .clamp (torch .round (wg /scale )+zp ,0 ,15 )
-        w_deq =(q -zp )*scale 
-        w_deq =w_deq .view (out ,padded_n )[:,:n ]
-        return w +(w_deq -w ).detach ()
+    def to_inference(self):
+        return BitLinearInference(self.in_features, self.out_features, self.weight.detach(), self.bias.detach() if self.bias is not None else None, self.group_size)
 
-    def forward (self ,x :torch .Tensor )->torch .Tensor :
-        w =self ._fake_quantize (self .weight )
-        return F .linear (x ,w ,self .bias )
-    def to_int4 (self ):
-        return Int4Linear (self .in_features ,self .out_features ,
-        self .weight .detach (),
-        self .bias .detach ()if self .bias is not None else None ,
-        self .group_size )
+class BitLinearInference(nn.Module):
+    def __init__(self, in_features, out_features, weight, bias=None, group_size=64):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        
+        out, n = weight.shape
+        n_groups = math.ceil(n / group_size)
+        padded_n = n_groups * group_size
+        w_pad = F.pad(weight, (0, padded_n - n)) if padded_n != n else weight
+        wg = w_pad.view(out, n_groups, group_size)
+        scale = wg.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+        w_q = torch.clamp(torch.round(wg / scale), -1, 1).to(torch.int8)
+        w_q = w_q.view(out, padded_n)[:, :n]
+        scale = scale.squeeze(-1)
+        
+        self.register_buffer("qweight", w_q)
+        self.register_buffer("scale", scale.half())
+        if bias is not None:
+            self.bias = nn.Parameter(bias.detach().half())
+        else:
+            self.register_parameter("bias", None)
 
-class Int4Linear (nn .Module ):
-    def __init__ (self ,in_features ,out_features ,weight ,bias =None ,group_size =64 ):
-        super ().__init__ ()
-        self .in_features =in_features 
-        self .out_features =out_features 
-        self .group_size =group_size 
-        q ,scale ,zp =quantize_tensor_int4 (weight .detach (),group_size )
-        self .register_buffer ("qweight",q )
-        self .register_buffer ("scale",scale .half ())
-        self .register_buffer ("zero_point",zp .half ())
-        if bias is not None :
-            self .bias =nn .Parameter (bias .detach ().half ())
-        else :
-            self .register_parameter ("bias",None )
+    def _dequantize_weight(self):
+        w = self.qweight.float()
+        groups = torch.arange(self.in_features, device=w.device) // self.group_size
+        return w * self.scale.float()[:, groups]
 
-    def _dequantize_weight (self ):
-        if hasattr (self ,"_cached_weight")and self ._cached_weight is not None :
-            return self ._cached_weight 
-        w =dequantize_tensor_int4 (
-        self .qweight ,self .scale ,self .zero_point ,
-        self .in_features ,self .group_size 
-        )
-        if not self .training :
-            self ._cached_weight =w 
-        return w
-
-    def forward (self ,x ):
-        bias =self .bias .float ()if self .bias is not None else None 
-        return F .linear (x ,self ._dequantize_weight (),bias )
+    def forward(self, x):
+        x_scale = (x.abs().max(dim=-1, keepdim=True).values / 127.0).clamp(min=1e-5)
+        x_q = torch.clamp(torch.round(x / x_scale), -128, 127)
+        x_deq = x_q * x_scale
+        bias = self.bias.float() if self.bias is not None else None
+        return F.linear(x_deq, self._dequantize_weight(), bias)
 
 def precompute_freqs (head_dim :int ,max_seq_len :int ,device ):
     theta =10000.0 **(-torch .arange (0 ,head_dim ,2 ,device =device ).float ()/head_dim )
@@ -252,9 +222,9 @@ def apply_rope (x :torch .Tensor ,cos :torch .Tensor ,sin :torch .Tensor ):
 class SwiGLUMLP (nn .Module ):
     def __init__ (self ,n_embd :int ,hidden :int ,dropout :float ,group_size :int =64 ):
         super ().__init__ ()
-        self .gate_proj =QATLinear (n_embd ,hidden ,bias =False ,group_size =group_size )
-        self .up_proj =QATLinear (n_embd ,hidden ,bias =False ,group_size =group_size )
-        self .down_proj =QATLinear (hidden ,n_embd ,bias =False ,group_size =group_size )
+        self .gate_proj =BitLinear (n_embd ,hidden ,bias =False ,group_size =group_size )
+        self .up_proj =BitLinear (n_embd ,hidden ,bias =False ,group_size =group_size )
+        self .down_proj =BitLinear (hidden ,n_embd ,bias =False ,group_size =group_size )
         self .drop =nn .Dropout (dropout )
 
     def forward (self ,x ):
@@ -298,8 +268,8 @@ class CausalSelfAttention (nn .Module ):
         assert n_embd %n_head ==0 
         self .n_head =n_head 
         self .head_dim =n_embd //n_head 
-        self .qkv =QATLinear (n_embd ,n_embd +2 *n_kv_head *self .head_dim ,bias =False ,group_size =group_size )
-        self .proj =QATLinear (n_embd ,n_embd ,bias =False ,group_size =group_size )
+        self .qkv =BitLinear (n_embd ,n_embd +2 *n_kv_head *self .head_dim ,bias =False ,group_size =group_size )
+        self .proj =BitLinear (n_embd ,n_embd ,bias =False ,group_size =group_size )
         self .attn_drop =nn .Dropout (dropout )
         self .resid_drop =nn .Dropout (dropout )
         self .register_buffer (
@@ -359,7 +329,7 @@ class Transformer (nn .Module ):
         self .drop =nn .Dropout (dropout )
         self .blocks =nn .ModuleList ([Block (n_embd ,n_head ,n_experts ,moe_hidden ,dropout ,group_size =group_size )for _ in range (n_layer )])
         self .ln_f =RMSNorm (n_embd )
-        self .lm_head =QATLinear (n_embd ,vocab_size ,bias =False ,group_size =group_size )
+        self .lm_head =BitLinear (n_embd ,vocab_size ,bias =False ,group_size =group_size )
         self .lm_head .weight =self .tok_emb .weight 
         head_dim =n_embd //n_head 
         cos ,sin =precompute_freqs (head_dim ,block_size ,device ="cpu")
@@ -372,7 +342,7 @@ class Transformer (nn .Module ):
             torch .nn .init .normal_ (module .weight ,mean =0.0 ,std =0.02 )
             if module .bias is not None :
                 torch .nn .init .zeros_ (module .bias )
-        elif isinstance (module ,QATLinear ):
+        elif isinstance (module ,BitLinear ):
             torch .nn .init .normal_ (module .weight ,mean =0.0 ,std =0.02 )
 
     def forward (self ,idx ,targets =None ):
@@ -438,12 +408,12 @@ def estimate_loss ():
         out [split ]=sum (losses )/len (losses )
     model .train ()
     return out 
-def convert_to_int4 (model :nn .Module )->nn .Module :
+def convert_to_bitlinear (model :nn .Module )->nn .Module :
     for name ,child in model .named_children ():
-        if isinstance (child ,QATLinear ):
-            setattr (model ,name ,child .to_int4 ())
+        if isinstance (child ,BitLinear ):
+            setattr (model ,name ,child .to_inference ())
         else :
-            convert_to_int4 (child )
+            convert_to_bitlinear (child )
     return model 
 
 def train ():
@@ -481,11 +451,11 @@ def train ():
             scheduler .step ()
     torch .save (model .state_dict (),checkpoint )
     print ("Full-precision model saved to",checkpoint )
-    # if os .path .isfile (checkpoint +".best"):
-    #     model .load_state_dict (torch .load (checkpoint +".best",map_location =device ))
-    #     model .eval ()
-    #     print ("Loaded best checkpoint for quantization.")
-    q_model =convert_to_int4 (deepcopy (model ))
+    if os .path .isfile (checkpoint +".best"):
+        model .load_state_dict (torch .load (checkpoint +".best",map_location =device ))
+        model .eval ()
+        print ("Loaded best checkpoint for quantization.")
+    q_model =convert_to_bitlinear (deepcopy (model ))
     with gzip .open (checkpoint +".quantized","wb")as f :
         torch .save (q_model ,f )
     quant_size =os .path .getsize (checkpoint +".quantized")
@@ -510,7 +480,7 @@ def load_model ():
         print (f"Loading unquantized checkpoint from {src } and quantizing...")
         model .load_state_dict (torch .load (src ,map_location =device ))
         model .eval ()
-        q_model =convert_to_int4 (deepcopy (model ))
+        q_model =convert_to_bitlinear (deepcopy (model ))
         with gzip .open (checkpoint +".quantized","wb")as f :
             torch .save (q_model ,f )
         print (f"Quantized and saved → {checkpoint }.quantized")
@@ -560,7 +530,7 @@ if __name__ =="__main__":
     import sys 
     force_train ="--train"in sys .argv 
     model =Transformer (group_size =qat_group_size ).to (device )
-    optimizer =torch .optim .AdamW (model .parameters (),lr =lr ,weight_decay =0.0 )
+    optimizer =torch .optim .AdamW (model .parameters (),lr =lr ,weight_decay =0.05 )
     if force_train :
         print ("Forcing training from scratch...")
         train ()

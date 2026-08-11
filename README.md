@@ -1,6 +1,6 @@
 # ESP-LLM: Technical Architecture & Inference Specification
 
-ESP-LLM is a bare-metal C++ inference engine designed to execute quantized Mixture-of-Experts (MoE) autoregressive transformers on resource-constrained microcontrollers (Espressif ESP32 and ESP8266). The system implements group-wise INT4 weight quantization, Multi-Query Attention (MQA), Rotary Position Embeddings (RoPE), SwiGLU non-linearities, zero-heap-allocation memory arenas, NonOS/FreeRTOS watchdog execution slicing, and a deterministic arithmetic coprocessor.
+ESP-LLM is a bare-metal C++ inference engine designed to execute quantized Mixture-of-Experts (MoE) autoregressive transformers on resource-constrained microcontrollers (Espressif ESP32 and ESP8266). The system implements BitNet b1.58 (1.58-bit ternary weight quantization with INT8 activations), Multi-Query Attention (MQA), Rotary Position Embeddings (RoPE), SwiGLU non-linearities, zero-heap-allocation memory arenas, NonOS/FreeRTOS watchdog execution slicing, and a deterministic arithmetic coprocessor.
 
 ---
 
@@ -21,7 +21,7 @@ The engine supports two distinct target configurations tailored to microcontroll
 | Expert Routing Policy | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) |
 | Context Window Capacity ($CTX$) | 48 tokens | 32 tokens |
 | Vocabulary Dimension ($Vocab$) | 1,024 BPE tokens | 1,024 BPE tokens |
-| Quantization Scheme | Asymmetric Group-wise INT4 ($G=64$) | Asymmetric Group-wise INT4 ($G=64$) |
+| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations | 1.58-bit Ternary Weights / INT8 Activations |
 | Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
 | Memory Management | 88 KB Dynamic Arena (from 275 KB Heap) | 40 KB Static BSS Buffer (Zero Heap) |
 | Static System RAM | ~23.7 KB | ~12.2 KB |
@@ -77,33 +77,31 @@ $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{N_{embd}} \sum_{i=1}^{N_{embd}} x_
 
 ---
 
-## 3. INT4 Quantization Engine & GEMM Kernel
+## 3. BitNet b1.58 Quantization Engine & GEMM Kernel
 
 ### 3.1 Quantization Representation
-Weights are quantized per channel in blocks of $G = 64$ elements using asymmetric affine mapping:
+Weights are quantized globally or per-group to ternary values `{-1, 0, 1}` using `absmean` scaling, bypassing zero-points:
 
-$$scale = \frac{\max(W_g) - \min(W_g)}{15}, \quad zp = \text{round}\left(-\frac{\min(W_g)}{scale}\right)$$
-$$W_{q} = \text{clamp}\left(\text{round}\left(\frac{W}{scale}\right) + zp, 0, 15\right)$$
+$$scale_{w} = \text{mean}(|W|)$$
+$$W_q = \text{clamp}\left(\text{round}\left(\frac{W}{scale_w}\right), -1, 1\right)$$
 
-Dequantization during matrix multiplication evaluates as:
+During the forward pass, activations are dynamically quantized to INT8 using `absmax` scaling per token:
 
-$$\hat{W} = (W_q - zp) \cdot scale$$
+$$scale_{x} = \frac{\max(|X|)}{127}$$
+$$X_q = \text{clamp}\left(\text{round}\left(\frac{X}{scale_x}\right), -128, 127\right)$$
 
-### 3.2 Storage Layout & 32-Bit Memory Alignment
-* Two 4-bit nibbles are packed into each `uint8_t`: `byte = (q0 & 0x0F) | ((q1 << 4) & 0xF0)`.
-* All weight tensors (`W_packed`), scale vectors, and zero-point offsets in flash are annotated with `__attribute__((aligned(4)))` and stored in `PROGMEM`. This avoids hardware load-store alignment faults (`LoadStoreAlignmentCause`) on 32-bit Tensilica buses.
+### 3.2 Storage Layout & 2-Bit Packing
+* Since ternary weights only require 3 states, they are efficiently packed using a 2-bit encoding scheme (mapping `-1 \rightarrow 2`, `0 \rightarrow 0`, `1 \rightarrow 1`).
+* This allows **4 weights to be packed into a single byte** (`uint8_t`), yielding a 50% storage reduction over standard INT4, halving flash footprint.
+* All weight tensors (`W_packed`) and scale vectors in flash are annotated with `__attribute__((aligned(4)))` and stored in `PROGMEM`.
 
-### 3.3 Optimized General Matrix-Vector Multiplication (`matmul_int4_f32`)
-* **Lookup Table Unpacking**: A 256-entry constant lookup table (`unpack_lut`) unpacks byte values into floating-point pairs without bit-shift instructions.
-* **4-Byte Unrolling**: Inner accumulation loops process 4 packed bytes (8 INT4 weights) per iteration:
-
-```cpp
-for (int j = 0; j < k_bytes; j += 4) {
-    uint8_t p0 = w_row[j], p1 = w_row[j+1], p2 = w_row[j+2], p3 = w_row[j+3];
-    NibblePair u0 = unpack_lut[p0], u1 = unpack_lut[p1];
-    NibblePair u2 = unpack_lut[p2], u3 = unpack_lut[p3];
-}
-```
+### 3.3 Zero-Multiplication Matrix Multiplication (`matmul_bitnet_ternary`)
+* Because weights are restricted to `{-1, 0, 1}`, matrix multiplication requires **zero mathematical multiplications**.
+* The inner GEMM loop unpacks the 2-bit weights and performs purely arithmetic integer additions and subtractions against an `int32_t` accumulator:
+  * If weight is `1`: `acc += X_q`
+  * If weight is `-1`: `acc -= X_q`
+* The final `int32_t` accumulator is scaled back to a `float` using the combined $scale_w \times scale_x$ factors.
+* This dramatically increases execution speed and lowers power consumption on microcontrollers lacking hardware multiplier arrays.
 
 ---
 

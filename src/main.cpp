@@ -24,10 +24,10 @@ static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
 static MemoryArena s_arena(s_arena_mem, ARENA_SIZE);
 static MemoryArena* arena = &s_arena;
 #else
-static constexpr int INFER_CTX       = 48;                
+static constexpr int INFER_CTX       = 64;                
 static constexpr int MAX_GEN_TOKENS  = 80;
 static constexpr float TEMPERATURE   = 0.0f;
-static constexpr size_t ARENA_SIZE   = 88 * 1024;
+static constexpr size_t ARENA_SIZE   = 130 * 1024;
 static MemoryArena* arena = nullptr;
 #endif
 
@@ -54,7 +54,7 @@ static void transformer_forward(int token, int pos) {
     for (int l = 0; l < N_LAYER; ++l) {
         const LayerW& lw = g_layers[l];
         rms_norm(g_x, g_xnorm, lw.ln1_g, N_EMBD);
-        matmul_int4_f32(lw.qkv_w, lw.qkv_s, lw.qkv_z, g_xnorm, g_qkv_out, N_EMBD + 2 * N_KV_HEAD * HEAD_DIM, N_EMBD, GRP);
+        matmul_bitnet_ternary(lw.qkv_w, lw.qkv_s, g_xnorm, g_qkv_out, N_EMBD + 2 * N_KV_HEAD * HEAD_DIM, N_EMBD, GRP);
         float* layer_kbuf = g_kbuf + l * (INFER_CTX * N_KV_HEAD * HEAD_DIM);
         float* layer_vbuf = g_vbuf + l * (INFER_CTX * N_KV_HEAD * HEAD_DIM);
         float* k_pos = layer_kbuf + pos * (N_KV_HEAD * HEAD_DIM);
@@ -84,7 +84,7 @@ static void transformer_forward(int token, int pos) {
                 for (int d = 0; d < HEAD_DIM; ++d) out_h[d] += a * v_h_ptr[d];
             }
         }
-        matmul_int4_f32(lw.proj_w, lw.proj_s, lw.proj_z, g_attn_out, g_proj_out, N_EMBD, N_EMBD, GRP);
+        matmul_bitnet_ternary(lw.proj_w, lw.proj_s, g_attn_out, g_proj_out, N_EMBD, N_EMBD, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_proj_out[d];
         rms_norm(g_x, g_xnorm, lw.ln2_g, N_EMBD);
         int best_expert = 0;
@@ -100,12 +100,12 @@ static void transformer_forward(int token, int pos) {
         int gate_s_off = best_expert * MLP_HIDDEN * ((N_EMBD + GRP - 1) / GRP);
         int down_q_off = best_expert * N_EMBD * ((MLP_HIDDEN + 1) / 2);
         int down_s_off = best_expert * N_EMBD * ((MLP_HIDDEN + GRP - 1) / GRP);
-        matmul_int4_f32(lw.experts_gate_q + gate_q_off, lw.experts_gate_s + gate_s_off, lw.experts_gate_z + gate_s_off, 
+        matmul_bitnet_ternary(lw.experts_gate_q + gate_q_off, lw.experts_gate_s + gate_s_off,
                         g_xnorm, g_mlp_gate, MLP_HIDDEN, N_EMBD, GRP);
-        matmul_int4_f32(lw.experts_up_q + gate_q_off, lw.experts_up_s + gate_s_off, lw.experts_up_z + gate_s_off,   
+        matmul_bitnet_ternary(lw.experts_up_q + gate_q_off, lw.experts_up_s + gate_s_off,
                         g_xnorm, g_mlp_up, MLP_HIDDEN, N_EMBD, GRP);
         swiglu(g_mlp_gate, g_mlp_up, g_mlp_hidden, MLP_HIDDEN);
-        matmul_int4_f32(lw.experts_down_q + down_q_off, lw.experts_down_s + down_s_off, lw.experts_down_z + down_s_off, 
+        matmul_bitnet_ternary(lw.experts_down_q + down_q_off, lw.experts_down_s + down_s_off,
                         g_mlp_hidden, g_mlp_out, N_EMBD, MLP_HIDDEN, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_mlp_out[d];
         yield();
@@ -490,9 +490,9 @@ void setup() {
     Serial.println("\n╔══════════════════════════╗");
     Serial.println("║      ESP-LLM  v1.0       ║");
 #if defined(ESP8266) || defined(ESP8266_BOARD)
-    Serial.println("║  INT4 Chatbot on ESP8266 ║");
+    Serial.println("║ BitNet 1.58b on ESP8266  ║");
 #else
-    Serial.println("║  INT4 Chatbot on ESP32   ║");
+    Serial.println("║ BitNet 1.58b on ESP32    ║");
 #endif
     Serial.println("╚══════════════════════════╝");
     Serial.printf("Free heap at boot (Wi-Fi OFF): %u B\n", (unsigned)ESP.getFreeHeap());

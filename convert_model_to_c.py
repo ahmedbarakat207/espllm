@@ -56,7 +56,7 @@ else:
     elif hasattr(state_dict, "blocks"):
         model = state_dict
     model.eval()
-    model = main.quantize_model_int4(model)
+    model = main.convert_to_bitlinear(model)
 print("Model loaded.")
 def unicode_to_bytes ():
     bs =list (range (ord ('!'),ord ('~')+1 ))+list (range (ord ('¡'),ord ('¬')+1 ))+list (range (ord ('®'),ord ('ÿ')+1 ))
@@ -89,32 +89,42 @@ for i in range (vocab_size ):
 
 vocab_offsets .append (len (vocab_bytes_flat ))
 
-def pack_int4 (weight :torch .Tensor ,group_size :int =GROUP_SIZE ):
-    out ,n =weight .shape 
-    n_groups =math .ceil (n /group_size )
-    padded_n =n_groups *group_size 
-    w =F .pad (weight .float (),(0 ,padded_n -n ))if padded_n !=n else weight .float ()
-    wg =w .view (out ,n_groups ,group_size )
-    wmin =wg .min (dim =-1 ,keepdim =True ).values 
-    wmax =wg .max (dim =-1 ,keepdim =True ).values 
-    scale =(wmax -wmin )/15.0 
-    scale =torch .where (scale ==0 ,torch .ones_like (scale ),scale )
-    zp =torch .round (-wmin /scale )
-    q =torch .clamp (torch .round (wg /scale )+zp ,0 ,15 ).to (torch .uint8 )
-    q =q .view (out ,padded_n )[:,:n ]
-    m =q .shape [1 ]
-    if m %2 :
-        q =F .pad (q ,(0 ,1 ))
-    packed =(q [:,0 ::2 ]&0x0F )|((q [:,1 ::2 ]<<4 )&0xF0 )
-    return packed .to (torch .uint8 ),scale .squeeze (-1 ),zp .squeeze (-1 )
+def get_quantized(mod):
+    if hasattr(mod, "qweight"):
+        q = mod.qweight
+        scale = mod.scale.float()
+    else:
+        w = mod.weight
+        group_size = getattr(mod, "group_size", GROUP_SIZE)
+        out, n = w.shape
+        n_groups = math.ceil(n / group_size)
+        padded_n = n_groups * group_size
+        w_pad = F.pad(w, (0, padded_n - n)) if padded_n != n else w
+        wg = w_pad.view(out, n_groups, group_size)
+        scale = wg.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+        q = torch.clamp(torch.round(wg / scale), -1, 1).to(torch.int8)
+        q = q.view(out, padded_n)[:, :n]
+        scale = scale.squeeze(-1)
+        
+    q_mapped = torch.where(q == -1, torch.tensor(2, dtype=torch.uint8, device=q.device), q.to(torch.uint8))
+    out, n = q_mapped.shape
+    pad_len = (4 - (n % 4)) % 4
+    if pad_len > 0:
+        q_mapped = F.pad(q_mapped, (0, pad_len))
+    
+    packed = (q_mapped[:, 0::4] & 0x03) | \
+             ((q_mapped[:, 1::4] & 0x03) << 2) | \
+             ((q_mapped[:, 2::4] & 0x03) << 4) | \
+             ((q_mapped[:, 3::4] & 0x03) << 6)
+             
+    return packed.to(torch.uint8), scale
 
-def get_quantized (mod ):
-    if hasattr (mod ,"qweight"):
-        return mod .qweight ,mod .scale .float (),mod .zero_point .float ()
-    elif hasattr (mod ,"weight"):
-        packed ,scale ,zp =pack_int4 (mod .weight )
-        return packed ,scale ,zp 
-    raise ValueError (f"Unknown layer type: {type (mod )}")
+def emit_quantized(prefix, packed, scale):
+    parts = [
+        emit_u8(packed, f"{prefix}_weights"),
+        emit_f32(scale, f"{prefix}_scales"),
+    ]
+    return "\n".join(parts)
 
 def emit_f32 (arr ,name ):
     flat =arr .detach ().cpu ().float ().numpy ().flatten ()
@@ -140,15 +150,7 @@ def emit_u8 (arr ,name ):
     lines .append ("};\n")
     return "\n".join (lines )
 
-def emit_quantized (prefix ,qweight ,scale ,zp ,bias =None ):
-    parts =[
-    emit_u8 (qweight ,f"{prefix }_weights"),
-    emit_f32 (scale ,f"{prefix }_scales"),
-    emit_f32 (zp ,f"{prefix }_zp"),
-    ]
-    if bias is not None :
-        parts .append (emit_f32 (bias .float (),f"{prefix }_bias"))
-    return "\n".join (parts )
+
 
 tok_emb_w =None 
 
@@ -164,7 +166,7 @@ n_kv_head =int ((n_kv_head -n_embd )/2 /(n_embd //n_head ))
 head_dim =n_embd //n_head 
 block_size =model .rope_cos .shape [0 ]
 mlp =model .blocks [0 ].mlp 
-first_gate_q ,_ ,_ =get_quantized (mlp .experts [0 ].gate_proj )
+first_gate_q ,_ =get_quantized (mlp .experts [0 ].gate_proj )
 mlp_hidden =first_gate_q .shape [0 ]
 n_experts =len (mlp .experts )
 
@@ -214,46 +216,43 @@ total_bytes += rope_cos.numel() * 4 * 2
 
 for li, block in enumerate(model.blocks):
     attn = block.attn
-    qkv_q, qkv_s, qkv_z = get_quantized(attn.qkv)
-    proj_q, proj_s, proj_z = get_quantized(attn.proj)
-    sections.append(emit_quantized(f"l{li}_attn_qkv", qkv_q, qkv_s, qkv_z))
-    sections.append(emit_quantized(f"l{li}_attn_proj", proj_q, proj_s, proj_z))
+    qkv_q, qkv_s = get_quantized(attn.qkv)
+    proj_q, proj_s = get_quantized(attn.proj)
+    sections.append(emit_quantized(f"l{li}_attn_qkv", qkv_q, qkv_s))
+    sections.append(emit_quantized(f"l{li}_attn_proj", proj_q, proj_s))
     sections.append(emit_f32(block.ln1.weight.detach().float(), f"l{li}_ln1_gamma"))
     sections.append(emit_f32(block.ln2.weight.detach().float(), f"l{li}_ln2_gamma"))
     router_w = block.mlp.router.weight.detach().float().flatten()
     sections.append(emit_f32(router_w, f"l{li}_router"))
     total_bytes += router_w.numel() * 4
-    gate_qs, gate_ss, gate_zs = zip(*[get_quantized(expert.gate_proj) for expert in block.mlp.experts])
-    up_qs, up_ss, up_zs = zip(*[get_quantized(expert.up_proj) for expert in block.mlp.experts])
-    down_qs, down_ss, down_zs = zip(*[get_quantized(expert.down_proj) for expert in block.mlp.experts])
+    gate_qs, gate_ss = zip(*[get_quantized(expert.gate_proj) for expert in block.mlp.experts])
+    up_qs, up_ss = zip(*[get_quantized(expert.up_proj) for expert in block.mlp.experts])
+    down_qs, down_ss = zip(*[get_quantized(expert.down_proj) for expert in block.mlp.experts])
     gate_q_concat = torch.cat(gate_qs, dim=0)
     gate_s_concat = torch.cat(gate_ss, dim=0)
-    gate_z_concat = torch.cat(gate_zs, dim=0)
     up_q_concat = torch.cat(up_qs, dim=0)
     up_s_concat = torch.cat(up_ss, dim=0)
-    up_z_concat = torch.cat(up_zs, dim=0)
     down_q_concat = torch.cat(down_qs, dim=0)
     down_s_concat = torch.cat(down_ss, dim=0)
-    down_z_concat = torch.cat(down_zs, dim=0)
-    sections.append(emit_quantized(f"l{li}_experts_gate", gate_q_concat, gate_s_concat, gate_z_concat))
-    sections.append(emit_quantized(f"l{li}_experts_up", up_q_concat, up_s_concat, up_z_concat))
-    sections.append(emit_quantized(f"l{li}_experts_down", down_q_concat, down_s_concat, down_z_concat))
+    sections.append(emit_quantized(f"l{li}_experts_gate", gate_q_concat, gate_s_concat))
+    sections.append(emit_quantized(f"l{li}_experts_up", up_q_concat, up_s_concat))
+    sections.append(emit_quantized(f"l{li}_experts_down", down_q_concat, down_s_concat))
     layer_bytes = qkv_q.numel() + proj_q.numel() + gate_q_concat.numel() + up_q_concat.numel() + down_q_concat.numel()
     total_bytes += layer_bytes
 sections.append(emit_f32(model.ln_f.weight.detach().float(), "ln_f_gamma"))
-first_qkv_q, _, _ = get_quantized(model.blocks[0].attn.qkv)
+first_qkv_q, _ = get_quantized(model.blocks[0].attn.qkv)
 sections.append(emit_u8(first_qkv_q, "model_weights"))
 sections.append(f"static const unsigned int model_weights_len = {first_qkv_q.numel()};\n")
 
 layer_inits = []
 for li in range(n_layer):
     layer_inits.append(f"""    {{
-        l{li}_attn_qkv_weights,      l{li}_attn_qkv_scales,      l{li}_attn_qkv_zp,
-        l{li}_attn_proj_weights,     l{li}_attn_proj_scales,     l{li}_attn_proj_zp,
+        l{li}_attn_qkv_weights,      l{li}_attn_qkv_scales,
+        l{li}_attn_proj_weights,     l{li}_attn_proj_scales,
         l{li}_router,
-        l{li}_experts_gate_weights,  l{li}_experts_gate_scales,  l{li}_experts_gate_zp,
-        l{li}_experts_up_weights,    l{li}_experts_up_scales,    l{li}_experts_up_zp,
-        l{li}_experts_down_weights,  l{li}_experts_down_scales,  l{li}_experts_down_zp,
+        l{li}_experts_gate_weights,  l{li}_experts_gate_scales,
+        l{li}_experts_up_weights,    l{li}_experts_up_scales,
+        l{li}_experts_down_weights,  l{li}_experts_down_scales,
         l{li}_ln1_gamma,
         l{li}_ln2_gamma,
     }}""")
@@ -261,18 +260,15 @@ for li in range(n_layer):
 layers_str = ",\n".join(layer_inits)
 sections.append(f"""
 struct LayerW {{
-    const uint8_t* qkv_w;  const float* qkv_s;  const float* qkv_z;
-    const uint8_t* proj_w; const float* proj_s; const float* proj_z;
+    const uint8_t* qkv_w;  const float* qkv_s;
+    const uint8_t* proj_w; const float* proj_s;
     const float* router_w;
     const uint8_t* experts_gate_q;
     const float*   experts_gate_s;
-    const float*   experts_gate_z;
     const uint8_t* experts_up_q;
     const float*   experts_up_s;
-    const float*   experts_up_z;
     const uint8_t* experts_down_q;
     const float*   experts_down_s;
-    const float*   experts_down_z;
     const float* ln1_g;
     const float* ln2_g;
 }};
