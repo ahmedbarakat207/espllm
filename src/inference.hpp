@@ -1,5 +1,5 @@
-#ifndef ESP32_INFERENCE_HPP
-#define ESP32_INFERENCE_HPP
+#ifndef ESP_LLM_INFERENCE_HPP
+#define ESP_LLM_INFERENCE_HPP
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -41,7 +41,6 @@ public:
     bool   is_valid()    const { return buffer != nullptr; }
     size_t used()        const { return offset; }
     size_t capacity()    const { return cap; }
-    size_t remaining()   const { return cap - offset; }
 };
 
 #if defined(ESP8266) || defined(ESP8266_BOARD)

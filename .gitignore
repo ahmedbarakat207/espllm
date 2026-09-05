@@ -2,4 +2,5 @@ todo.txt
 __pycache__/
 .pio/
 .vscode/
-compile_commands.js
+.DS_Store
+compile_commands.json

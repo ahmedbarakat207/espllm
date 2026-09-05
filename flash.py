@@ -30,6 +30,7 @@ def get_pio_path():
 def auto_detect_port():
     try:
         import serial.tools.list_ports
+
         ports = list(serial.tools.list_ports.comports())
         if ports:
             return ports[0].device
@@ -40,13 +41,33 @@ def auto_detect_port():
 
 def main():
     parser = argparse.ArgumentParser(description="Build, flash, and monitor ESP-LLM.")
-    parser.add_argument("target", nargs="?", default=None, choices=["esp32", "esp8266", "esp32dev", "esp32s3", "monitor"], help="Target architecture or 'monitor'")
-    parser.add_argument("-p", "--port", default=None, help="Serial port (e.g. COM4, /dev/ttyUSB0)")
-    parser.add_argument("-b", "--baud", type=int, default=115200, help="Baud rate (default: 115200)")
-    parser.add_argument("--build-only", action="store_true", help="Compile without uploading")
-    parser.add_argument("--monitor-only", action="store_true", help="Open serial monitor without flashing")
-    parser.add_argument("-m", "--monitor", action="store_true", help="Open serial monitor after upload")
-    parser.add_argument("--skip-convert", action="store_true", help="Skip running convert_model_to_c.py")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        choices=["esp32", "esp8266", "esp32dev", "esp32s3", "monitor"],
+        help="Target architecture or 'monitor'",
+    )
+    parser.add_argument(
+        "-p", "--port", default=None, help="Serial port (e.g. COM4, /dev/ttyUSB0)"
+    )
+    parser.add_argument(
+        "-b", "--baud", type=int, default=115200, help="Baud rate (default: 115200)"
+    )
+    parser.add_argument(
+        "--build-only", action="store_true", help="Compile without uploading"
+    )
+    parser.add_argument(
+        "--monitor-only",
+        action="store_true",
+        help="Open serial monitor without flashing",
+    )
+    parser.add_argument(
+        "-m", "--monitor", action="store_true", help="Open serial monitor after upload"
+    )
+    parser.add_argument(
+        "--skip-convert", action="store_true", help="Skip running convert_model_to_c.py"
+    )
     args = parser.parse_args()
 
     pio = get_pio_path()
