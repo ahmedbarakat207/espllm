@@ -15,7 +15,7 @@ static constexpr int MLP_HIDDEN      = model_mlp_hidden;
 static constexpr int N_EXPERTS       = model_n_experts;                
 static constexpr int GRP             = model_group_size;                
 #if defined(ESP8266) || defined(ESP8266_BOARD)
-static constexpr int INFER_CTX       = 32;                
+static constexpr int INFER_CTX       = 28;
 static constexpr int MAX_GEN_TOKENS  = 60;
 static constexpr float TEMPERATURE   = 0.0f;
 static constexpr size_t ARENA_SIZE   = 40 * 1024;
@@ -32,10 +32,10 @@ static constexpr float TEMPERATURE   = 0.0f;
 static constexpr size_t ARENA_SIZE   = 1400 * 1024;
 static MemoryArena* arena = nullptr;
 #else
-static constexpr int INFER_CTX       = 64;                
+static constexpr int INFER_CTX       = 64;
 static constexpr int MAX_GEN_TOKENS  = 80;
 static constexpr float TEMPERATURE   = 0.0f;
-static constexpr size_t ARENA_SIZE   = 130 * 1024;
+static constexpr size_t ARENA_SIZE   = 160 * 1024;
 static MemoryArena* arena = nullptr;
 #endif
 

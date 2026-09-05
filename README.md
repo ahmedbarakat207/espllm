@@ -13,22 +13,22 @@ The engine supports three target configurations tailored to microcontroller SRAM
 | Core Architecture | Xtensa Dual-Core LX7 @ 240 MHz | Xtensa Dual-Core LX6 @ 240 MHz | Tensilica L106 Single-Core @ 80/160 MHz |
 | Flash / PSRAM Requirement | 16 MB flash / 8 MB octal PSRAM | 4 MB flash | 4 MB flash |
 | Embedding Dimension ($N_{embd}$) | 192 | 128 | 64 |
-| Transformer Layers ($N_{layer}$) | 12 | 6 | 4 |
+| Transformer Layers ($N_{layer}$) | 12 | 8 | 4 |
 | Query Attention Heads ($N_{head}$) | 6 | 4 | 2 |
 | Key/Value Attention Heads ($N_{kv\_head}$) | 2 (Grouped-Query Attention) | 1 (Multi-Query Attention) | 1 (Multi-Query Attention) |
 | Head Dimension ($HeadDim$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) |
-| MLP Hidden Dimension ($MLP_{hidden}$) | 256 | 128 | 64 |
-| Mixture-of-Experts ($N_{experts}$) | 28 experts per layer | 16 experts per layer | 20 experts per layer |
+| MLP Hidden Dimension ($MLP_{hidden}$) | 256 | 192 | 64 |
+| Mixture-of-Experts ($N_{experts}$) | 28 experts per layer | 16 experts per layer | 32 experts per layer |
 | Expert Routing Policy | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) |
-| Context Window Capacity ($CTX$) | 192 tokens | 48 tokens | 32 tokens |
+| Context Window Capacity ($CTX$) | 192 tokens | 64 tokens | 28 tokens (trained on 32-token windows) |
 | Vocabulary Dimension ($Vocab$) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) |
-| Total Parameters | ~51.2 M | ~6.1 M | ~1.2 M |
-| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations | 1.58-bit Ternary Weights / INT8 Activations |
+| Total Parameters | ~51.2 M | ~10.0 M | ~1.8 M |
+| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales |
 | Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
-| Memory Management | 1400 KB Arena in octal PSRAM | 88 KB Dynamic Arena (from 275 KB Heap) | 40 KB Static BSS Buffer (Zero Heap) |
-| Static System RAM | ~23.7 KB | ~23.7 KB | ~12.2 KB |
-| Active Inference SRAM | ~1.2 MB (PSRAM) | 82,904 Bytes (~81.0 KB) | 38,544 Bytes (~37.6 KB) |
-| Binary Flash Consumption | ~14.6 MB (of 15.9 MB app partition) | ~3.0 MB | ~1.2 MB |
+| Memory Management | 1400 KB Arena in octal PSRAM | 160 KB Dynamic Arena (heap) | 40 KB Static BSS Buffer (Zero Heap) |
+| Static System RAM (measured) | ~19 KB | ~22 KB | ~70 KB (incl. 40 KB arena, 86% of 80 KB) |
+| Active Inference SRAM | ~1.2 MB (PSRAM) | ~150 KB (of 160 KB heap arena) | ~38.6 KB (of 40 KB static arena) |
+| Binary Flash Consumption | ~14.6 MB (91.8% of 15.9 MB app) | ~3.4 MB (83.8% of 3.9 MB app) | ~0.9 MB (89.4% of 1.0 MB irom) |
 
 ---
 
@@ -114,56 +114,57 @@ The inference engine avoids heap fragmentation by allocating a single static or 
 
 ```
 +-------------------------------------------------------------+
-| MemoryArena Pool (88 KB on ESP32 / 40 KB on ESP8266)        |
+| MemoryArena Pool (160 KB heap on ESP32 / 40 KB BSS on ESP8266) |
 +-------------------------------------------------------------+
 | Offset | Tensor Buffer | Size   | Description               |
 +--------+---------------+--------+---------------------------+
-| 0x0000 | g_x           | 512 B  | Token hidden state vector |
-| 0x0200 | g_kbuf        | 36 KB  | Multi-layer Key cache     |
-| 0x9200 | g_vbuf        | 36 KB  | Multi-layer Value cache   |
-| 0x12200| g_xnorm       | 512 B  | RMSNorm normalized vector |
-| 0x12400| g_qkv_out     | 768 B  | Fused QKV projection      |
-| 0x12700| g_attn_out    | 512 B  | Multi-head accumulator    |
-| 0x12900| g_proj_out    | 512 B  | Attention dense output    |
-| 0x12B00| g_att         | 192 B  | Attention softmax scores  |
-| 0x12BC0| g_mlp_gate    | 512 B  | Active expert gate        |
-| 0x12DC0| g_mlp_up      | 512 B  | Active expert up          |
-| 0x12FC0| g_mlp_hidden  | 512 B  | SwiGLU activation vector  |
-| 0x131C0| g_mlp_out     | 512 B  | Expert down projection    |
-| 0x133C0| g_logits      | 4 KB   | Output vocabulary logits  |
+| 0x00000| g_x           | 512 B  | Token hidden state vector |
+| 0x00200| g_kbuf        | 64 KB  | Multi-layer Key cache     |
+| 0x10200| g_vbuf        | 64 KB  | Multi-layer Value cache   |
+| 0x20200| g_xnorm       | 512 B  | RMSNorm normalized vector |
+| 0x20400| g_qkv_out     | 768 B  | Fused QKV projection      |
+| 0x20700| g_attn_out    | 512 B  | Multi-head accumulator    |
+| 0x20900| g_proj_out    | 512 B  | Attention dense output    |
+| 0x20B00| g_att         | 256 B  | Attention softmax scores  |
+| 0x20C00| g_mlp_gate    | 768 B  | Active expert gate        |
+| 0x20F00| g_mlp_up      | 768 B  | Active expert up          |
+| 0x21200| g_mlp_hidden  | 768 B  | SwiGLU activation vector  |
+| 0x21500| g_mlp_out     | 512 B  | Expert down projection    |
+| 0x21700| g_logits      | 8 KB   | Output vocabulary logits  |
 +-------------------------------------------------------------+
-| Headroom: ~5.1 KB reserved for alignment and safety buffer  |
+| ESP32 footprint: 145,152 B (~141.8 KB), ~18 KB headroom     |
+| ESP8266 footprint: 39,536 B (~38.6 KB), ~1.4 KB headroom    |
 +-------------------------------------------------------------+
 ```
 
 ### 4.2 SRAM Allocation Matrix
 
-#### ESP32 Target ($CTX=48, N_{embd}=128, N_{layer}=6$)
+#### ESP32 Target ($CTX=64, N_{embd}=128, N_{layer}=8$)
 | Allocation Target | Dimension / Calculation | Bytes |
 |---|---|---|
-| Key Cache (`g_kbuf`) | $6 \times 48 \times 1 \times 32 \times 4\text{ B}$ (6 layers, 48 ctx, 1 KV head, 32 dim) | 36,864 |
-| Value Cache (`g_vbuf`) | $6 \times 48 \times 1 \times 32 \times 4\text{ B}$ (6 layers, 48 ctx, 1 KV head, 32 dim) | 36,864 |
-| Vocabulary Logits (`g_logits`) | $1024 \times 4\text{ B}$ (1024 vocabulary tokens) | 4,096 |
+| Key Cache (`g_kbuf`) | $8 \times 64 \times 1 \times 32 \times 4\text{ B}$ (8 layers, 64 ctx, 1 KV head, 32 dim) | 65,536 |
+| Value Cache (`g_vbuf`) | $8 \times 64 \times 1 \times 32 \times 4\text{ B}$ (8 layers, 64 ctx, 1 KV head, 32 dim) | 65,536 |
+| Vocabulary Logits (`g_logits`) | $2048 \times 4\text{ B}$ (2048 vocabulary tokens) | 8,192 |
 | QKV Projection Buffer (`g_qkv_out`) | $(128 + 2 \times 32) \times 4\text{ B}$ | 768 |
 | Hidden State Vector (`g_x`) | $128 \times 4\text{ B}$ | 512 |
 | Normalized State (`g_xnorm`) | $128 \times 4\text{ B}$ | 512 |
 | Attention Projection (`g_attn_out`) | $128 \times 4\text{ B}$ | 512 |
 | Dense Projection (`g_proj_out`) | $128 \times 4\text{ B}$ | 512 |
-| MLP Gate Projection (`g_mlp_gate`) | $128 \times 4\text{ B}$ | 512 |
-| MLP Up Projection (`g_mlp_up`) | $128 \times 4\text{ B}$ | 512 |
-| SwiGLU Intermediate (`g_mlp_hidden`) | $128 \times 4\text{ B}$ | 512 |
+| MLP Gate Projection (`g_mlp_gate`) | $192 \times 4\text{ B}$ | 768 |
+| MLP Up Projection (`g_mlp_up`) | $192 \times 4\text{ B}$ | 768 |
+| SwiGLU Intermediate (`g_mlp_hidden`) | $192 \times 4\text{ B}$ | 768 |
 | MLP Down Projection (`g_mlp_out`) | $128 \times 4\text{ B}$ | 512 |
-| Attention Score Buffer (`g_att`) | $48 \times 4\text{ B}$ | 192 |
-| **Total Arena Footprint** | **Mapped in 88 KB Pool** | **82,904 B (~81.0 KB)** |
+| Attention Score Buffer (`g_att`) | $64 \times 4\text{ B}$ | 256 |
+| **Total Arena Footprint** | **Mapped in 160 KB Pool** | **145,152 B (~141.8 KB)** |
 
-#### ESP8266 Target ($CTX=32, N_{embd}=64, N_{layer}=4$)
+#### ESP8266 Target ($CTX=28, N_{embd}=64, N_{layer}=4$)
 | Allocation Target | Dimension / Calculation | Bytes |
 |---|---|---|
-| Key Cache (`g_kbuf`) | $4 \times 32 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 32 ctx, 1 KV head, 32 dim) | 16,384 |
-| Value Cache (`g_vbuf`) | $4 \times 32 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 32 ctx, 1 KV head, 32 dim) | 16,384 |
-| Vocabulary Logits (`g_logits`) | $1024 \times 4\text{ B}$ (1024 vocabulary tokens) | 4,096 |
-| Intermediate Activation Buffers | Sum of activation vectors | 1,680 |
-| **Total Arena Footprint** | **Static BSS Buffer (Zero Heap Allocation)** | **38,544 B (~37.6 KB)** |
+| Key Cache (`g_kbuf`) | $4 \times 28 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 28 ctx, 1 KV head, 32 dim) | 14,336 |
+| Value Cache (`g_vbuf`) | $4 \times 28 \times 1 \times 32 \times 4\text{ B}$ (4 layers, 28 ctx, 1 KV head, 32 dim) | 14,336 |
+| Vocabulary Logits (`g_logits`) | $2048 \times 4\text{ B}$ (2048 vocabulary tokens) | 8,192 |
+| Intermediate Activation Buffers | Sum of activation vectors | 2,672 |
+| **Total Arena Footprint** | **Static BSS Buffer (Zero Heap Allocation)** | **39,536 B (~38.6 KB)** |
 
 ### 4.3 Pinned Few-Shot Sliding Window Management
 When conversation context reaches capacity ($ctx\_len \ge INFER\_CTX$):

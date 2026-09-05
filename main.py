@@ -26,14 +26,16 @@ for arg in sys.argv:
         TARGET = "esp32"
 
 if TARGET == "esp8266":
+    # Max config fitting 1MB irom + 40KB static arena (INT8 emb + FP16 scales).
+    # block 32 > infer 24: trains on fuller answers, inference uses first 24 rows.
     checkpoint = "./model/model_esp8266.pt"
-    block_size = 64
+    block_size = 32
     batch_size = 32
     n_layer = 4
     n_head = 2
     n_kv_head = 1
     n_embd = 64
-    n_experts = 20
+    n_experts = 32
     moe_hidden = 64
     dropout = 0.2
     max_iters = 10000
@@ -73,15 +75,16 @@ elif TARGET == "esp32s3":
     label_smoothing = 0.05
     qat_group_size = 64
 else:
+    # Max config fitting 3.9MB app + 160KB heap arena (INT8 emb + FP16 scales).
     checkpoint = "./model/model_esp32.pt"
-    block_size = 128
+    block_size = 64
     batch_size = 32
-    n_layer = 7
+    n_layer = 8
     n_head = 4
     n_kv_head = 1
     n_embd = 128
     n_experts = 16
-    moe_hidden = 128
+    moe_hidden = 192
     dropout = 0.0
     max_iters = 20000
     eval_interval = 100
