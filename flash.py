@@ -40,7 +40,7 @@ def auto_detect_port():
 
 def main():
     parser = argparse.ArgumentParser(description="Build, flash, and monitor ESP-LLM.")
-    parser.add_argument("target", nargs="?", default=None, choices=["esp32", "esp8266", "esp32dev", "monitor"], help="Target architecture or 'monitor'")
+    parser.add_argument("target", nargs="?", default=None, choices=["esp32", "esp8266", "esp32dev", "esp32s3", "monitor"], help="Target architecture or 'monitor'")
     parser.add_argument("-p", "--port", default=None, help="Serial port (e.g. COM4, /dev/ttyUSB0)")
     parser.add_argument("-b", "--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("--build-only", action="store_true", help="Compile without uploading")
@@ -63,7 +63,7 @@ def main():
             pass
         return
 
-    env_name = "esp8266" if args.target == "esp8266" else "esp32dev"
+    env_name = {"esp8266": "esp8266", "esp32s3": "esp32s3"}.get(args.target, "esp32dev")
 
     if not args.skip_convert:
         convert_cmd = [sys.executable, "convert_model_to_c.py", args.target]

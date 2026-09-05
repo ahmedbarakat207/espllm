@@ -20,6 +20,8 @@ for arg in sys.argv:
         TARGET = arg.split("=")[1].strip()
     elif arg in ("--esp8266", "-esp8266"):
         TARGET = "esp8266"
+    elif arg in ("--esp32s3", "-esp32s3"):
+        TARGET = "esp32s3"
     elif arg in ("--esp32", "-esp32"):
         TARGET = "esp32"
 
@@ -45,6 +47,32 @@ if TARGET == "esp8266":
     start_iter = 0
     patience = 10
     label_smoothing = 0.1
+    qat_group_size = 64
+elif TARGET == "esp32s3":
+    # Largest config fitting ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
+    # INT8 embeddings + FP16 scales: ~14.6MB binary in 15.9MB app partition.
+    # PSRAM arena ~1.2MB.
+    checkpoint = "./model/model_esp32s3.pt"
+    block_size = 192
+    batch_size = 32
+    n_layer = 12
+    n_head = 6
+    n_kv_head = 2
+    n_embd = 192
+    n_experts = 28
+    moe_hidden = 256
+    dropout = 0.1
+    max_iters = 25000
+    eval_interval = 200
+    lr = 2e-3
+    lr_min = 1e-5
+    warmup_iters = 400
+    eval_iters = 10
+    generate_tokens = 400
+    temperature = 0.6
+    start_iter = 0
+    patience = 12
+    label_smoothing = 0.05
     qat_group_size = 64
 else:
     checkpoint = "./model/model_esp32.pt"

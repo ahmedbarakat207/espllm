@@ -55,7 +55,7 @@ static inline void llm_optimistic_yield(uint32_t every_n_ops = 256) {
         yield();
     }
 }
-#elif defined(ESP32)
+#elif defined(ESP32) || defined(ESP32S3_BOARD)
 #include <Arduino.h>
 static inline void llm_optimistic_yield(uint32_t every_n_ops = 512) {
     static uint32_t counter = 0;
@@ -74,9 +74,45 @@ static inline float dot_f32(const float* a, const float* b, int n) {
     return s;
 }
 
+// IEEE-754 binary16 -> float32 (no FPU support needed). Used for group scales.
+static inline float half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = ((uint32_t)h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else { // subnormal: normalize
+            exp = 1;
+            while (!(mant & 0x400u)) { mant <<= 1; exp--; }
+            mant &= 0x3FFu;
+            f = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+// INT8 embedding row (2's complement in a uint8_t array) -> float.
+static inline void dequant_emb_row(const uint8_t* qrow, float scale, float* out, int n) {
+    for (int i = 0; i < n; ++i) out[i] = (float)((int8_t)qrow[i]) * scale;
+}
+
+static inline float dot_emb_q(const float* x, const uint8_t* qrow, float scale, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += x[i] * (float)((int8_t)qrow[i]);
+    return s * scale;
+}
+
 void matmul_bitnet_ternary(
     const uint8_t* W_packed,
-    const float*   scales,
+    const uint16_t* scales,
     const float*   x,
     float*         y,
     int            out_features,
@@ -86,8 +122,15 @@ void matmul_bitnet_ternary(
     const int n_groups = (in_features + group_size - 1) / group_size;
     const int k_bytes  = (in_features + 3) / 4;
     
-    // 1. Quantize x to int8
-    int8_t x_q[1024]; // Safe for our max in_features of ~128
+    // 1. Quantize x to int8 (stack fast-path, heap fallback for wide layers)
+    int8_t x_q_stack[1024];
+    int8_t* x_q = x_q_stack;
+    bool x_q_heap = false;
+    if (in_features > 1024) {
+        x_q = (int8_t*)malloc((size_t)in_features);
+        if (!x_q) return; // OOM: leave y untouched, caller fails loudly downstream
+        x_q_heap = true;
+    }
     float max_abs = 1e-5f;
     for (int i = 0; i < in_features; ++i) {
         float ax = fabsf(x[i]);
@@ -109,7 +152,7 @@ void matmul_bitnet_ternary(
     for (int i = 0; i < out_features; ++i) {
         llm_optimistic_yield(64);
         const uint8_t* w_row = W_packed + (size_t)i * k_bytes;
-        const float*   s_row = scales   + (size_t)i * n_groups;
+        const uint16_t* s_row = scales   + (size_t)i * n_groups;
         
         float acc_float = 0.0f;
         
@@ -126,10 +169,11 @@ void matmul_bitnet_ternary(
                 int8_t w = ternary_map[packed_val];
                 group_acc += w * x_q[j];
             }
-            acc_float += (float)group_acc * s_row[g];
+            acc_float += (float)group_acc * half_to_float(s_row[g]);
         }
         y[i] = acc_float * x_scale;
     }
+    if (x_q_heap) free(x_q);
 }
 
 void rms_norm(const float* x, float* y, const float* gamma, int n, float eps = 1e-5f) {
@@ -154,7 +198,8 @@ void swiglu(const float* gate, const float* up, float* out, int n) {
 
 void apply_rope_row(float* x, const float* cos_row, const float* sin_row, int head_dim) {
     int half = head_dim / 2;
-    float tmp[64];
+    float tmp[128]; // supports head_dim up to 128
+    if (head_dim > 128) return;
     for (int i = 0; i < half; ++i) {
         float x0 = x[2 * i];
         float x1 = x[2 * i + 1];

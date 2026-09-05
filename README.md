@@ -1,32 +1,34 @@
 # ESP-LLM: Technical Architecture & Inference Specification
 
-ESP-LLM is a bare-metal C++ inference engine designed to execute quantized Mixture-of-Experts (MoE) autoregressive transformers on resource-constrained microcontrollers (Espressif ESP32 and ESP8266). The system implements BitNet b1.58 (1.58-bit ternary weight quantization with INT8 activations), Multi-Query Attention (MQA), Rotary Position Embeddings (RoPE), SwiGLU non-linearities, zero-heap-allocation memory arenas, NonOS/FreeRTOS watchdog execution slicing, and a deterministic arithmetic coprocessor.
+ESP-LLM is a bare-metal C++ inference engine designed to execute quantized Mixture-of-Experts (MoE) autoregressive transformers on resource-constrained microcontrollers (Espressif ESP32-S3, ESP32 and ESP8266). The system implements BitNet b1.58 (1.58-bit ternary weight quantization with INT8 activations), Multi-Query Attention (MQA), Rotary Position Embeddings (RoPE), SwiGLU non-linearities, zero-heap-allocation memory arenas, NonOS/FreeRTOS watchdog execution slicing, and a deterministic arithmetic coprocessor.
 
 ---
 
 ## 1. System Architecture & Hardware Profiles
 
-The engine supports two distinct target configurations tailored to microcontroller SRAM and flash constraints:
+The engine supports three target configurations tailored to microcontroller SRAM and flash constraints:
 
-| Architectural Parameter | ESP32 (esp32dev) | ESP8266 (nodemcuv2 / d1_mini) |
-|---|---|---|
-| Core Architecture | Xtensa Dual-Core LX6 @ 240 MHz | Tensilica L106 Single-Core @ 80/160 MHz |
-| Embedding Dimension ($N_{embd}$) | 128 | 64 |
-| Transformer Layers ($N_{layer}$) | 6 | 4 |
-| Query Attention Heads ($N_{head}$) | 4 | 2 |
-| Key/Value Attention Heads ($N_{kv\_head}$) | 1 (Multi-Query Attention) | 1 (Multi-Query Attention) |
-| Head Dimension ($HeadDim$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) |
-| MLP Hidden Dimension ($MLP_{hidden}$) | 128 | 64 |
-| Mixture-of-Experts ($N_{experts}$) | 16 experts per layer | 20 experts per layer |
-| Expert Routing Policy | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) |
-| Context Window Capacity ($CTX$) | 48 tokens | 32 tokens |
-| Vocabulary Dimension ($Vocab$) | 1,024 BPE tokens | 1,024 BPE tokens |
-| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations | 1.58-bit Ternary Weights / INT8 Activations |
-| Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
-| Memory Management | 88 KB Dynamic Arena (from 275 KB Heap) | 40 KB Static BSS Buffer (Zero Heap) |
-| Static System RAM | ~23.7 KB | ~12.2 KB |
-| Active Inference SRAM | 82,904 Bytes (~81.0 KB) | 38,544 Bytes (~37.6 KB) |
-| Binary Flash Consumption | ~3.0 MB | ~1.2 MB |
+| Architectural Parameter | ESP32-S3 (N16R8) | ESP32 (esp32dev) | ESP8266 (nodemcuv2 / d1_mini) |
+|---|---|---|---|
+| Core Architecture | Xtensa Dual-Core LX7 @ 240 MHz | Xtensa Dual-Core LX6 @ 240 MHz | Tensilica L106 Single-Core @ 80/160 MHz |
+| Flash / PSRAM Requirement | 16 MB flash / 8 MB octal PSRAM | 4 MB flash | 4 MB flash |
+| Embedding Dimension ($N_{embd}$) | 192 | 128 | 64 |
+| Transformer Layers ($N_{layer}$) | 12 | 6 | 4 |
+| Query Attention Heads ($N_{head}$) | 6 | 4 | 2 |
+| Key/Value Attention Heads ($N_{kv\_head}$) | 2 (Grouped-Query Attention) | 1 (Multi-Query Attention) | 1 (Multi-Query Attention) |
+| Head Dimension ($HeadDim$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) |
+| MLP Hidden Dimension ($MLP_{hidden}$) | 256 | 128 | 64 |
+| Mixture-of-Experts ($N_{experts}$) | 28 experts per layer | 16 experts per layer | 20 experts per layer |
+| Expert Routing Policy | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) |
+| Context Window Capacity ($CTX$) | 192 tokens | 48 tokens | 32 tokens |
+| Vocabulary Dimension ($Vocab$) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) |
+| Total Parameters | ~51.2 M | ~6.1 M | ~1.2 M |
+| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations | 1.58-bit Ternary Weights / INT8 Activations |
+| Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
+| Memory Management | 1400 KB Arena in octal PSRAM | 88 KB Dynamic Arena (from 275 KB Heap) | 40 KB Static BSS Buffer (Zero Heap) |
+| Static System RAM | ~23.7 KB | ~23.7 KB | ~12.2 KB |
+| Active Inference SRAM | ~1.2 MB (PSRAM) | 82,904 Bytes (~81.0 KB) | 38,544 Bytes (~37.6 KB) |
+| Binary Flash Consumption | ~14.6 MB (of 15.9 MB app partition) | ~3.0 MB | ~1.2 MB |
 
 ---
 
@@ -201,6 +203,18 @@ Before triggering transformer prefill, user input is passed through an integrate
 
 ### 6.1 Compilation and Flashing
 
+To train the ESP32-S3 model from scratch (requires `model/model_esp32s3.pt`):
+
+```bash
+python main.py --target=esp32s3 --train
+```
+
+To export weights, compile firmware, and flash to an ESP32-S3 (N16R8: 16 MB flash + 8 MB PSRAM):
+
+```bash
+python flash.py esp32s3
+```
+
 To export weights, compile firmware, and flash to an ESP32:
 ```bash
 python flash.py esp32
@@ -237,6 +251,75 @@ python run.py -p COM4 -b 115200
 
 To manually regenerate `src/model_weights.hpp` from a model checkpoint:
 ```bash
+python convert_model_to_c.py esp32s3
 python convert_model_to_c.py esp32
 python convert_model_to_c.py esp8266
 ```
+
+### 6.4 ESP32-S3 Notes (N16R8)
+
+* Requires a 16 MB flash + 8 MB octal-PSRAM module (e.g. ESP32-S3-WROOM-1-N16R8 / DevKitC-1 N16R8).
+  The `esp32s3` env overrides the base DevKitC-1 board with `qio_opi` PSRAM mode, 16 MB flash,
+  and a custom `partitions_s3_16MB.csv` layout (single ~15.9 MB app partition, no OTA, no
+  spiffs/coredump — the firmware uses neither, so every byte goes to the model).
+* Export storage formats (all applied post-training in `convert_model_to_c.py`):
+  ternary 2-bit-packed weights, per-group **FP16** scales (firmware converts via `half_to_float`,
+  max error ~8e-4 vs FP32), per-token **INT8** embedding table + FP32 row scales
+  (logit error ~5e-4 relative). Router, norms, and RoPE stay FP32.
+* The ~1.2 MB inference arena is allocated in PSRAM via `ps_malloc` (SRAM fallback attempted,
+  boot fails gracefully with `[FAIL]` if neither fits). Firmware prints PSRAM size at startup.
+* `INFER_CTX` (192) is compile-time checked against the trained `block_size`
+  (`static_assert` in `main.cpp`): always re-export weights after retraining.
+
+---
+
+## 7. Dataset & Training
+
+### 7.1 Dataset (`dataset.txt`, `build_dataset.py`)
+
+The chatbot dataset is **generated deterministically** (seed 1337) by `build_dataset.py`, which merges
+the checked-in conversational base with a large synthetic set and writes `dataset.txt`:
+
+```bash
+python build_dataset.py
+```
+
+Current stats: **99,823 pairs, ~2.4 M tokens, 5.6 MB**, format `User: <question>` / `Bot: <answer>`
+line pairs (the exact shape `main.py`'s loader expects).
+
+* **Persona is locked**: Chatty, a tiny AI chatbot running on a microcontroller, created by
+  developers. Identity answers are repeated across hundreds of paraphrases so the model learns
+  them exactly. Honest limits are drilled the same way: no internet, clock, camera, or body.
+* **Content families**: greetings, feelings/small-talk, capabilities, jokes (~80), fun facts (~100),
+  world capitals, word definitions, ELI5 explainers, advice, micro-stories/poems, riddles,
+  exact arithmetic (thousands of programmatic pairs), numbers/order, spelling, opposites/plurals,
+  mini-translations, unit conversions, school one-liners, motivation, plus graceful
+  *I-don't-know* fallbacks (gibberish, unknown words, politics/religion deflects).
+* **Robustness by construction**: every question ships in many noisy surface forms
+  (case, punctuation, elongations, fillers, light typos) and most questions map to several valid
+  answers, teaching paraphrase tolerance and response diversity instead of robotic repeats.
+* **Length discipline**: every pair is length-gated with the real BPE tokenizer
+  (question ≤ 48, answer ≤ 84, pair ≤ 160 tokens; observed max 73), so nothing is ever
+  truncated by the 192-token training block and batches stay clean.
+* The legacy base pairs were persona-normalized by the generator
+  (`trained by researchers` → `created by developers`) for a single consistent creator story.
+
+### 7.2 Training
+
+```bash
+python main.py --target=esp32s3 --train   # ~51 M-param S3 model (default 25k iters)
+python main.py --target=esp32 --train
+python main.py --target=esp8266 --train
+```
+
+Training uses QAT (BitLinear fake-quantization), cosine schedule with warmup, MoE load-balance
+aux loss, label smoothing, gradient clipping, and early stopping on a held-out 10% split with
+automatic best-checkpoint restore (`*.pt.best`) plus post-training quantization (`*.pt.quantized`,
+the artifact the firmware export consumes). On Apple Silicon the S3 run is roughly a day;
+`flash.py <target>` re-exports weights and flashes in one step.
+
+Realistic expectations: the S3 bot is coherent and personable inside its drilled lane
+(greetings, chit-chat, jokes, facts, simple Q&A, exact arithmetic via the on-device harness),
+single-turn only, greedy-decoded, and unreliable outside its training distribution.
+The highest-ROI future upgrade is **distillation** — replacing template answers with
+frontier-model outputs and retraining.

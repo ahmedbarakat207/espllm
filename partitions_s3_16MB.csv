@@ -1,0 +1,7 @@
+# ESP32-S3 16MB flash (N16R8) — maximum single app partition for the 50M+ model.
+# Requires 16MB flash. No OTA (upload via serial directly to app0).
+# spiffs/coredump omitted: firmware uses neither; every byte goes to the app.
+# Name,   Type, SubType, Offset,    Size,      Flags
+nvs,      data, nvs,     0x9000,    0x5000,
+otadata,  data, ota,     0xe000,    0x2000,
+app0,     app,  ota_0,   0x10000,   0xFE0000,

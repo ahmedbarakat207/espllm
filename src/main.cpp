@@ -23,6 +23,14 @@ static constexpr size_t ARENA_SIZE   = 40 * 1024;
 static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
 static MemoryArena s_arena(s_arena_mem, ARENA_SIZE);
 static MemoryArena* arena = &s_arena;
+#elif defined(ESP32S3_BOARD)
+// Max-size profile: ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
+// Arena (~1.2MB used) lives in octal PSRAM.
+static constexpr int INFER_CTX       = 192;
+static constexpr int MAX_GEN_TOKENS  = 100;
+static constexpr float TEMPERATURE   = 0.0f;
+static constexpr size_t ARENA_SIZE   = 1400 * 1024;
+static MemoryArena* arena = nullptr;
 #else
 static constexpr int INFER_CTX       = 64;                
 static constexpr int MAX_GEN_TOKENS  = 80;
@@ -48,9 +56,11 @@ static uint16_t ctx_ids[INFER_CTX];
 static int     ctx_len = 0;
 static int     ctx_pos = 0;
 
+// Inference context must not exceed the RoPE tables baked from training.
+static_assert(INFER_CTX <= (int)model_block_size, "INFER_CTX exceeds trained block_size: regenerate model_weights.hpp");
+
 static void transformer_forward(int token, int pos) {
-    const float* emb = tok_emb + token * N_EMBD;
-    memcpy(g_x, emb, N_EMBD * sizeof(float));
+    dequant_emb_row(tok_emb_q + (size_t)token * N_EMBD, tok_emb_scales[token], g_x, N_EMBD);
     for (int l = 0; l < N_LAYER; ++l) {
         const LayerW& lw = g_layers[l];
         rms_norm(g_x, g_xnorm, lw.ln1_g, N_EMBD);
@@ -96,9 +106,10 @@ static void transformer_forward(int token, int pos) {
                 best_expert = e;
             }
         }
-        int gate_q_off = best_expert * MLP_HIDDEN * ((N_EMBD + 1) / 2);
+        // 2-bit packing => 4 weights/byte, so bytes/row = ceil(in_features / 4).
+        int gate_q_off = best_expert * MLP_HIDDEN * ((N_EMBD + 3) / 4);
         int gate_s_off = best_expert * MLP_HIDDEN * ((N_EMBD + GRP - 1) / GRP);
-        int down_q_off = best_expert * N_EMBD * ((MLP_HIDDEN + 1) / 2);
+        int down_q_off = best_expert * N_EMBD * ((MLP_HIDDEN + 3) / 4);
         int down_s_off = best_expert * N_EMBD * ((MLP_HIDDEN + GRP - 1) / GRP);
         matmul_bitnet_ternary(lw.experts_gate_q + gate_q_off, lw.experts_gate_s + gate_s_off,
                         g_xnorm, g_mlp_gate, MLP_HIDDEN, N_EMBD, GRP);
@@ -112,7 +123,7 @@ static void transformer_forward(int token, int pos) {
     }
     rms_norm(g_x, g_xnorm, ln_f_gamma, N_EMBD);
     for (int v = 0; v < (int)model_vocab_size; ++v)
-        g_logits[v] = dot_f32(g_xnorm, tok_emb + v * N_EMBD, N_EMBD);
+        g_logits[v] = dot_emb_q(g_xnorm, tok_emb_q + (size_t)v * N_EMBD, tok_emb_scales[v], N_EMBD);
 }
 
 static bool print_token(int id) {
@@ -481,6 +492,12 @@ void setup() {
     delay(1);
     ESP.wdtEnable(5000);
     ESP.wdtFeed();
+#elif defined(ESP32S3_BOARD)
+    if (!arena) {
+        uint8_t* p = (uint8_t*)ps_malloc(ARENA_SIZE); // 8MB octal PSRAM on N16R8
+        if (!p) p = (uint8_t*)malloc(ARENA_SIZE);      // last-resort SRAM attempt
+        if (p) arena = new MemoryArena(p, ARENA_SIZE);
+    }
 #else
     if (!arena) {
         arena = new MemoryArena(ARENA_SIZE);
@@ -491,11 +508,18 @@ void setup() {
     Serial.println("║      ESP-LLM  v1.0       ║");
 #if defined(ESP8266) || defined(ESP8266_BOARD)
     Serial.println("║ BitNet 1.58b on ESP8266  ║");
+#elif defined(ESP32S3_BOARD)
+    Serial.println("║ BitNet 1.58b on ESP32-S3 ║");
 #else
     Serial.println("║ BitNet 1.58b on ESP32    ║");
 #endif
     Serial.println("╚══════════════════════════╝");
+#if defined(ESP32S3_BOARD)
+    Serial.printf("PSRAM: %u B | Free heap at boot: %u B\n",
+                  (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreeHeap());
+#else
     Serial.printf("Free heap at boot (Wi-Fi OFF): %u B\n", (unsigned)ESP.getFreeHeap());
+#endif
 
     if (!arena || !arena->is_valid() || !alloc_buffers()) {
         Serial.printf("[FAIL] Memory arena allocation failed (need %u KB, free %u B)\n",
