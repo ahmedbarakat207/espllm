@@ -5,6 +5,11 @@ from tokenizers import ByteLevelBPETokenizer
 import os, gzip
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+try:
+    from torchao.optim import AdamW4bit
+except ImportError:
+    AdamW4bit = None
+
 if torch.cuda.is_available():
     device = "cuda"
 elif torch.backends.mps.is_available():
@@ -24,6 +29,19 @@ for arg in sys.argv:
         TARGET = "esp32s3"
     elif arg in ("--esp32", "-esp32"):
         TARGET = "esp32"
+
+# DeepSpeed ZeRO (multi-GPU data-parallel) flags. Single-GPU default is unchanged.
+# Launch with: deepspeed --num_gpus=2 main.py --target=esp32s3 --train --deepspeed --deepspeed_config=ds_config_zero2.json
+USE_DEEPSPEED = "--deepspeed" in sys.argv
+DS_CONFIG = "./ds_config_zero2.json"
+for _i, _arg in enumerate(sys.argv):
+    if _arg.startswith("--deepspeed_config="):
+        DS_CONFIG = _arg.split("=", 1)[1].strip()
+    elif _arg == "--deepspeed_config" and _i + 1 < len(sys.argv):
+        DS_CONFIG = sys.argv[_i + 1].strip()
+DIST = False  # True once torch.distributed is initialized (deepspeed path only)
+RANK = 0
+WORLD = 1
 
 if TARGET == "esp8266":
     # Max config fitting 1MB irom + 40KB static arena (INT8 emb + FP16 scales).
@@ -97,6 +115,25 @@ else:
     patience = 10
     label_smoothing = 0.0
     qat_group_size = 64
+
+# Optional env overrides (handy for smoke tests, e.g. ESPGPT_MAX_ITERS=4).
+# ESPGPT_DEVICE forces the device (cpu/cuda/mps); ESPGPT_CHECKPOINT redirects saves.
+if os.environ.get("ESPGPT_MAX_ITERS"):
+    max_iters = int(os.environ["ESPGPT_MAX_ITERS"])
+if os.environ.get("ESPGPT_BATCH_SIZE"):
+    batch_size = int(os.environ["ESPGPT_BATCH_SIZE"])
+if os.environ.get("ESPGPT_EVAL_ITERS"):
+    eval_iters = int(os.environ["ESPGPT_EVAL_ITERS"])
+if os.environ.get("ESPGPT_EVAL_INTERVAL"):
+    eval_interval = int(os.environ["ESPGPT_EVAL_INTERVAL"])
+if os.environ.get("ESPGPT_WARMUP_ITERS"):
+    warmup_iters = int(os.environ["ESPGPT_WARMUP_ITERS"])
+if os.environ.get("ESPGPT_PATIENCE"):
+    patience = int(os.environ["ESPGPT_PATIENCE"])
+if os.environ.get("ESPGPT_CHECKPOINT"):
+    checkpoint = os.environ["ESPGPT_CHECKPOINT"]
+if os.environ.get("ESPGPT_DEVICE"):
+    device = os.environ["ESPGPT_DEVICE"]
 
 torch.manual_seed(1337)
 
@@ -506,6 +543,17 @@ def estimate_loss():
             _, loss = model(xb, yb)
             losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
+    if DIST:
+        # Average the local estimates across ranks so every rank logs the
+        # same global numbers (keeps early-stopping decisions in sync).
+        import torch.distributed as dist
+
+        # NCCL needs CUDA tensors, gloo needs CPU tensors.
+        _dev = device if torch.cuda.is_available() else "cpu"
+        t = torch.tensor([out["train"], out["val"]], device=_dev)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= WORLD
+        out = {"train": t[0].item(), "val": t[1].item()}
     model.train()
     return out
 
@@ -521,39 +569,73 @@ def convert_to_bitlinear(model: nn.Module) -> nn.Module:
 
 def train():
     global model
+    engine = globals().get("engine", None)
+    is_main = RANK == 0
+    if DIST:
+        # Model weights were initialized identically on all ranks (torch seed
+        # 1337 at import). Now decorrelate per-rank stochasticity (dropout
+        # masks) now that init is done; `random` drives per-rank batch sampling.
+        torch.manual_seed(1337 + RANK)
+        random.seed(1337 + RANK)
     best_val_loss = float("inf")
     patience_counter = 0
-    scheduler = CosineAnnealingLR(optimizer, T_max=20000, eta_min=lr_min)
+    # In the deepspeed path `optimizer` IS the engine's optimizer (same object
+    # passed to deepspeed.initialize), so manual warmup + CosineAnnealingLR
+    # keep working untouched. Grad clipping comes from the ds config.
+    opt = engine.optimizer if engine is not None else optimizer
+    scheduler = CosineAnnealingLR(opt, T_max=20000, eta_min=lr_min)
     for it in range(start_iter, max_iters + 1):
         if it < warmup_iters:
             warmup_lr = lr * (it + 1) / warmup_iters
-            for pg in optimizer.param_groups:
+            for pg in opt.param_groups:
                 pg["lr"] = warmup_lr
         if it % eval_interval == 0:
             losses = estimate_loss()
-            cur_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"iter {it :5d} | train {losses ['train']:.4f} | val {losses ['val']:.4f} "
-                f"| lr {cur_lr :.2e}"
-            )
+            # NOTE: losses are identical on all ranks (all-reduced), so every
+            # rank updates counters and hits `break` together. Only rank 0
+            # prints/saves to avoid duplicate logs and file races.
             if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
                 patience_counter = 0
-                torch.save(model.state_dict(), checkpoint + ".best")
-                print(f"  * new best ({best_val_loss:.4f}) saved")
+                if is_main:
+                    cur_lr = opt.param_groups[0]["lr"]
+                    print(
+                        f"iter {it :5d} | train {losses ['train']:.4f} | val {losses ['val']:.4f} "
+                        f"| lr {cur_lr :.2e}"
+                    )
+                    torch.save(model.state_dict(), checkpoint + ".best")
+                    print(f"  * new best ({best_val_loss:.4f}) saved")
             else:
                 patience_counter += 1
+                if is_main:
+                    cur_lr = opt.param_groups[0]["lr"]
+                    print(
+                        f"iter {it :5d} | train {losses ['train']:.4f} | val {losses ['val']:.4f} "
+                        f"| lr {cur_lr :.2e}"
+                    )
                 if patience_counter >= patience:
-                    print("Early stopping triggered.")
+                    if is_main:
+                        print("Early stopping triggered.")
                     break
         xb, yb = get_batch("train")
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if engine is not None:
+            logits, loss = engine(xb, yb)
+            engine.backward(loss)
+            engine.step()
+        else:
+            logits, loss = model(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         if it >= warmup_iters:
             scheduler.step()
+    if not is_main:
+        if DIST:
+            import torch.distributed as dist
+
+            dist.barrier()
+        return
     torch.save(model.state_dict(), checkpoint)
     print("Full-precision model saved to", checkpoint)
     if os.path.isfile(checkpoint + ".best"):
@@ -567,6 +649,10 @@ def train():
     print(
         f"Quantized model saved → {checkpoint }.quantized  ({quant_size /1024 :.1f} KB)"
     )
+    if DIST:
+        import torch.distributed as dist
+
+        dist.barrier()
 
 
 def load_model():
@@ -642,11 +728,64 @@ if __name__ == "__main__":
     import sys
 
     force_train = "--train" in sys.argv
+    use_fp_adam = "--fp-adam" in sys.argv or "--no-4bit" in sys.argv
+    engine = None
+    ds_mode = USE_DEEPSPEED and force_train
+    if USE_DEEPSPEED and not force_train:
+        print("NOTE: --deepspeed only affects --train; running single-device mode.")
+    if ds_mode:
+        # Multi-GPU data-parallel via DeepSpeed ZeRO. The launcher
+        # (`deepspeed --num_gpus=N ...`) injects --local_rank and NCCL env vars.
+        try:
+            import deepspeed
+        except ImportError:
+            print("ERROR: --deepspeed needs the `deepspeed` package: pip install deepspeed")
+            sys.exit(1)
+        deepspeed.init_distributed()
+        import torch.distributed as dist
+
+        DIST = True
+        RANK = dist.get_rank()
+        WORLD = dist.get_world_size()
+        _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(_local_rank)
+            device = f"cuda:{_local_rank}"
+        # Different DATA per rank: get_batch() samples via `random`, so each
+        # rank must draw DIFFERENT batches (else both GPUs redo the same work).
+        # The shared initial shuffle at import (seed 1337) stays identical, and
+        # the torch seed is deliberately left at 1337 so every rank
+        # initializes IDENTICAL weights (required for data-parallel: averaged
+        # grads are only valid on identical models). Dropout is decorrelated
+        # per-rank at the top of train(), i.e. after init.
+        random.seed(1337 + RANK)
+        if RANK == 0:
+            print(f"DeepSpeed ZeRO mode: world_size={WORLD}, config={DS_CONFIG}")
     model = Transformer(group_size=qat_group_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+    if ds_mode:
+        # ZeRO shards the optimizer states itself, so the 4-bit torchao AdamW
+        # (single-GPU only) is intentionally bypassed here.
+        print("Using standard 32-bit AdamW optimizer (required for DeepSpeed ZeRO)...")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+        model_engine, optimizer, _, _ = deepspeed.initialize(
+            model=model, optimizer=optimizer, config=DS_CONFIG
+        )
+        engine = model_engine
+    elif AdamW4bit is not None and not use_fp_adam:
+        print("Using 4-bit AdamW optimizer (torchao.optim.AdamW4bit)...")
+        optimizer = AdamW4bit(model.parameters(), lr=lr, weight_decay=0.05)
+    else:
+        print("Using standard 32-bit AdamW optimizer (torch.optim.AdamW)...")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     if force_train:
         print("Forcing training from scratch...")
         train()
+        if ds_mode:
+            # Rank 0 already saved .pt / .best / .quantized inside train().
+            import torch.distributed as dist
+
+            dist.destroy_process_group()
+            sys.exit(0)
         load_model()
         print("Training and quantization complete. Exiting.")
         sys.exit(0)
