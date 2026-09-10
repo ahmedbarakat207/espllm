@@ -579,10 +579,12 @@ def train():
         random.seed(1337 + RANK)
     best_val_loss = float("inf")
     patience_counter = 0
-    # In the deepspeed path `optimizer` IS the engine's optimizer (same object
-    # passed to deepspeed.initialize), so manual warmup + CosineAnnealingLR
-    # keep working untouched. Grad clipping comes from the ds config.
-    opt = engine.optimizer if engine is not None else optimizer
+    # In the deepspeed path `optimizer` is the BASE torch optimizer (see
+    # __main__: the DeepSpeedZeroOptimizer wrapper is not a torch Optimizer,
+    # so the torch scheduler + manual warmup keep driving the base optimizer,
+    # whose param_groups the engine reads at step time). Grad clipping comes
+    # from the ds config.
+    opt = optimizer
     scheduler = CosineAnnealingLR(opt, T_max=20000, eta_min=lr_min)
     for it in range(start_iter, max_iters + 1):
         if it < warmup_iters:
@@ -766,10 +768,16 @@ if __name__ == "__main__":
         # ZeRO shards the optimizer states itself, so the 4-bit torchao AdamW
         # (single-GPU only) is intentionally bypassed here.
         print("Using standard 32-bit AdamW optimizer (required for DeepSpeed ZeRO)...")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
-        model_engine, optimizer, _, _ = deepspeed.initialize(
-            model=model, optimizer=optimizer, config=DS_CONFIG
+        base_optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+        # NOTE: deepspeed.initialize wraps base_optimizer in a
+        # DeepSpeedZeroOptimizer (which is NOT a torch Optimizer and must not
+        # be passed to torch LR schedulers). The engine reads LR from the BASE
+        # optimizer's param_groups at step time, so warmup + CosineAnnealingLR
+        # in train() keep driving `base_optimizer` — same schedule as 1-GPU.
+        model_engine, _, _, _ = deepspeed.initialize(
+            model=model, optimizer=base_optimizer, config=DS_CONFIG
         )
+        optimizer = base_optimizer
         engine = model_engine
     elif AdamW4bit is not None and not use_fp_adam:
         print("Using 4-bit AdamW optimizer (torchao.optim.AdamW4bit)...")
