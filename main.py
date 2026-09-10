@@ -2,8 +2,22 @@ import math, torch, torch.nn as nn
 from torch.nn import functional as F
 from copy import deepcopy
 from tokenizers import ByteLevelBPETokenizer
-import os, gzip
+import os, gzip, warnings, logging, datetime
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# ── Suppress all warnings that could clutter logs or look alarming ──────────
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)  # silence torch/deepspeed/NCCL warnings
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")     # C++ side: errors only
+os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "OFF")    # no dist debug dumps
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")    # don't abort on async err
+os.environ.setdefault("NCCL_BLOCKING_WAIT", "0")           # non-blocking NCCL waits
+os.environ.setdefault("NCCL_TIMEOUT", "1800")              # 30 min NCCL timeout
+os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")              # safer for shared nodes
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")             # avoid P2P issues on Kaggle
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")         # keep async for perf
 
 try:
     from torchao.optim import AdamW4bit
@@ -341,6 +355,11 @@ class SparseMoEBlock(nn.Module):
         routing_probs = F.softmax(router_logits, dim=-1)
         top1_probs, top1_indices = torch.max(routing_probs, dim=-1)
         out_flat = torch.zeros_like(x_flat)
+        # Use a single dummy token (detached) to keep idle experts in the
+        # backward graph.  Without this, multi-GPU data-parallel (NCCL)
+        # deadlocks because one rank triggers an AllReduce for an expert's
+        # gradients while the other rank never enters that expert.
+        dummy = x_flat[:1].detach()
         for i, expert in enumerate(self.experts):
             mask = top1_indices == i
             if mask.any():
@@ -349,6 +368,10 @@ class SparseMoEBlock(nn.Module):
                 scale = top1_probs[mask].unsqueeze(-1)
                 expert_out = expert_out * (scale - scale.detach() + 1.0)
                 out_flat[mask] = expert_out
+            else:
+                # Zero-valued contribution keeps expert params in the graph
+                # so their gradients are produced (and AllReduced) on every rank.
+                out_flat = out_flat + 0.0 * expert(dummy).sum()
         out = out_flat.view(B, T, C)
         route_frac = torch.bincount(
             top1_indices, minlength=self.n_experts
@@ -620,16 +643,30 @@ def train():
                         print("Early stopping triggered.")
                     break
         xb, yb = get_batch("train")
-        if engine is not None:
-            logits, loss = engine(xb, yb)
-            engine.backward(loss)
-            engine.step()
-        else:
-            logits, loss = model(xb, yb)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+        try:
+            if engine is not None:
+                logits, loss = engine(xb, yb)
+                engine.backward(loss)
+                engine.step()
+            else:
+                logits, loss = model(xb, yb)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if is_main:
+                    print(f"  [OOM at iter {it}] skipping batch, clearing cache")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if engine is not None:
+                    engine.optimizer.zero_grad()
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                continue  # skip this iteration
+            else:
+                raise  # re-raise non-OOM errors
         if it >= warmup_iters:
             scheduler.step()
     if not is_main:
@@ -743,7 +780,9 @@ if __name__ == "__main__":
         except ImportError:
             print("ERROR: --deepspeed needs the `deepspeed` package: pip install deepspeed")
             sys.exit(1)
-        deepspeed.init_distributed()
+        deepspeed.init_distributed(
+            timeout=datetime.timedelta(minutes=30),
+        )
         import torch.distributed as dist
 
         DIST = True

@@ -22,5 +22,7 @@
   },
   "gradient_clipping": 1.0,
   "fp16": { "enabled": false },
-  "bf16": { "enabled": false }
+  "bf16": { "enabled": false },
+  "comms_logger": { "enabled": false },
+  "communication_data_type": null
 }
