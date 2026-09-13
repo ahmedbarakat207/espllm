@@ -82,17 +82,15 @@ if TARGET == "esp8266":
     label_smoothing = 0.1
     qat_group_size = 64
 elif TARGET == "esp32s3":
-    # Largest config fitting ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
-    # INT8 embeddings + FP16 scales: ~14.6MB binary in 15.9MB app partition.
-    # PSRAM arena ~1.2MB.
+    # ESP32-S3 N16R8 (16MB flash + 8MB PSRAM)
     checkpoint = "./model/model_esp32s3.pt"
-    block_size = 192
+    block_size = 512
     batch_size = 32
     n_layer = 12
     n_head = 6
     n_kv_head = 2
     n_embd = 192
-    n_experts = 28
+    n_experts = 36
     moe_hidden = 256
     dropout = 0.1
     max_iters = 25000
@@ -355,10 +353,6 @@ class SparseMoEBlock(nn.Module):
         routing_probs = F.softmax(router_logits, dim=-1)
         top1_probs, top1_indices = torch.max(routing_probs, dim=-1)
         out_flat = torch.zeros_like(x_flat)
-        # Use a single dummy token (detached) to keep idle experts in the
-        # backward graph.  Without this, multi-GPU data-parallel (NCCL)
-        # deadlocks because one rank triggers an AllReduce for an expert's
-        # gradients while the other rank never enters that expert.
         dummy = x_flat[:1].detach()
         for i, expert in enumerate(self.experts):
             mask = top1_indices == i
@@ -369,8 +363,6 @@ class SparseMoEBlock(nn.Module):
                 expert_out = expert_out * (scale - scale.detach() + 1.0)
                 out_flat[mask] = expert_out
             else:
-                # Zero-valued contribution keeps expert params in the graph
-                # so their gradients are produced (and AllReduced) on every rank.
                 out_flat = out_flat + 0.0 * expert(dummy).sum()
         out = out_flat.view(B, T, C)
         route_frac = torch.bincount(

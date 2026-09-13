@@ -24,12 +24,12 @@ static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
 static MemoryArena s_arena(s_arena_mem, ARENA_SIZE);
 static MemoryArena* arena = &s_arena;
 #elif defined(ESP32S3_BOARD)
-// Max-size profile: ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
-// Arena (~1.2MB used) lives in octal PSRAM.
-static constexpr int INFER_CTX       = 192;
-static constexpr int MAX_GEN_TOKENS  = 100;
+// High-capacity profile: ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
+// Arena (4.0MB used) lives in octal PSRAM, supporting up to 512 context tokens.
+static constexpr int INFER_CTX       = (512 < (int)model_block_size) ? 512 : (int)model_block_size;
+static constexpr int MAX_GEN_TOKENS  = 256;
 static constexpr float TEMPERATURE   = 0.0f;
-static constexpr size_t ARENA_SIZE   = 1400 * 1024;
+static constexpr size_t ARENA_SIZE   = 4096 * 1024;
 static MemoryArena* arena = nullptr;
 #else
 static constexpr int INFER_CTX       = 64;
@@ -55,6 +55,20 @@ static float* g_logits;
 static uint16_t ctx_ids[INFER_CTX];
 static int     ctx_len = 0;
 static int     ctx_pos = 0;
+
+#if defined(ESP32S3_BOARD)
+struct ExpertPSRAMCache {
+    uint8_t*  gate_q;
+    uint16_t* gate_s;
+    uint8_t*  up_q;
+    uint16_t* up_s;
+    uint8_t*  down_q;
+    uint16_t* down_s;
+    int       cached_layer;
+    int       cached_expert;
+};
+static ExpertPSRAMCache g_expert_cache = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, -1, -1 };
+#endif
 
 // Inference context must not exceed the RoPE tables baked from training.
 static_assert(INFER_CTX <= (int)model_block_size, "INFER_CTX exceeds trained block_size: regenerate model_weights.hpp");
@@ -106,17 +120,56 @@ static void transformer_forward(int token, int pos) {
                 best_expert = e;
             }
         }
-        // 2-bit packing => 4 weights/byte, so bytes/row = ceil(in_features / 4).
-        int gate_q_off = best_expert * MLP_HIDDEN * ((N_EMBD + 3) / 4);
-        int gate_s_off = best_expert * MLP_HIDDEN * ((N_EMBD + GRP - 1) / GRP);
-        int down_q_off = best_expert * N_EMBD * ((MLP_HIDDEN + 3) / 4);
-        int down_s_off = best_expert * N_EMBD * ((MLP_HIDDEN + GRP - 1) / GRP);
-        matmul_bitnet_ternary(lw.experts_gate_q + gate_q_off, lw.experts_gate_s + gate_s_off,
+        int gate_n_groups = (N_EMBD + GRP - 1) / GRP;
+        int gate_bytes_per_row = gate_n_groups * ((GRP + 4) / 5);
+        int gate_q_off = best_expert * MLP_HIDDEN * gate_bytes_per_row;
+        int gate_s_off = best_expert * MLP_HIDDEN * gate_n_groups;
+
+        int down_n_groups = (MLP_HIDDEN + GRP - 1) / GRP;
+        int down_bytes_per_row = down_n_groups * ((GRP + 4) / 5);
+        int down_q_off = best_expert * N_EMBD * down_bytes_per_row;
+        int down_s_off = best_expert * N_EMBD * down_n_groups;
+
+        const uint8_t* p_gate_q = lw.experts_gate_q + gate_q_off;
+        const uint16_t* p_gate_s = lw.experts_gate_s + gate_s_off;
+        const uint8_t* p_up_q = lw.experts_up_q + gate_q_off;
+        const uint16_t* p_up_s = lw.experts_up_s + gate_s_off;
+        const uint8_t* p_down_q = lw.experts_down_q + down_q_off;
+        const uint16_t* p_down_s = lw.experts_down_s + down_s_off;
+
+#if defined(ESP32S3_BOARD)
+        if (g_expert_cache.gate_q && (g_expert_cache.cached_layer != l || g_expert_cache.cached_expert != best_expert)) {
+            size_t gate_q_sz = (size_t)MLP_HIDDEN * gate_bytes_per_row;
+            size_t gate_s_sz = (size_t)MLP_HIDDEN * gate_n_groups * sizeof(uint16_t);
+            size_t down_q_sz = (size_t)N_EMBD * down_bytes_per_row;
+            size_t down_s_sz = (size_t)N_EMBD * down_n_groups * sizeof(uint16_t);
+
+            memcpy(g_expert_cache.gate_q, p_gate_q, gate_q_sz);
+            memcpy(g_expert_cache.gate_s, p_gate_s, gate_s_sz);
+            memcpy(g_expert_cache.up_q, p_up_q, gate_q_sz);
+            memcpy(g_expert_cache.up_s, p_up_s, gate_s_sz);
+            memcpy(g_expert_cache.down_q, p_down_q, down_q_sz);
+            memcpy(g_expert_cache.down_s, p_down_s, down_s_sz);
+
+            g_expert_cache.cached_layer = l;
+            g_expert_cache.cached_expert = best_expert;
+        }
+        if (g_expert_cache.gate_q) {
+            p_gate_q = g_expert_cache.gate_q;
+            p_gate_s = g_expert_cache.gate_s;
+            p_up_q   = g_expert_cache.up_q;
+            p_up_s   = g_expert_cache.up_s;
+            p_down_q = g_expert_cache.down_q;
+            p_down_s = g_expert_cache.down_s;
+        }
+#endif
+
+        matmul_bitnet_ternary(p_gate_q, p_gate_s,
                         g_xnorm, g_mlp_gate, MLP_HIDDEN, N_EMBD, GRP);
-        matmul_bitnet_ternary(lw.experts_up_q + gate_q_off, lw.experts_up_s + gate_s_off,
+        matmul_bitnet_ternary(p_up_q, p_up_s,
                         g_xnorm, g_mlp_up, MLP_HIDDEN, N_EMBD, GRP);
         swiglu(g_mlp_gate, g_mlp_up, g_mlp_hidden, MLP_HIDDEN);
-        matmul_bitnet_ternary(lw.experts_down_q + down_q_off, lw.experts_down_s + down_s_off,
+        matmul_bitnet_ternary(p_down_q, p_down_s,
                         g_mlp_hidden, g_mlp_out, N_EMBD, MLP_HIDDEN, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_mlp_out[d];
         yield();
@@ -477,9 +530,37 @@ static bool alloc_buffers() {
     g_mlp_hidden = (float*)arena->alloc(MLP_HIDDEN             * sizeof(float));
     g_mlp_out    = (float*)arena->alloc(N_EMBD                 * sizeof(float));
     g_logits     = (float*)arena->alloc(model_vocab_size       * sizeof(float));
+
+#if defined(ESP32S3_BOARD)
+    int gate_n_groups = (N_EMBD + GRP - 1) / GRP;
+    int gate_bytes_per_row = gate_n_groups * ((GRP + 4) / 5);
+    size_t gate_q_sz = (size_t)MLP_HIDDEN * gate_bytes_per_row;
+    size_t gate_s_sz = (size_t)MLP_HIDDEN * gate_n_groups * sizeof(uint16_t);
+
+    int down_n_groups = (MLP_HIDDEN + GRP - 1) / GRP;
+    int down_bytes_per_row = down_n_groups * ((GRP + 4) / 5);
+    size_t down_q_sz = (size_t)N_EMBD * down_bytes_per_row;
+    size_t down_s_sz = (size_t)N_EMBD * down_n_groups * sizeof(uint16_t);
+
+    g_expert_cache.gate_q = (uint8_t*)arena->alloc(gate_q_sz);
+    g_expert_cache.gate_s = (uint16_t*)arena->alloc(gate_s_sz);
+    g_expert_cache.up_q   = (uint8_t*)arena->alloc(gate_q_sz);
+    g_expert_cache.up_s   = (uint16_t*)arena->alloc(gate_s_sz);
+    g_expert_cache.down_q = (uint8_t*)arena->alloc(down_q_sz);
+    g_expert_cache.down_s = (uint16_t*)arena->alloc(down_s_sz);
+    g_expert_cache.cached_layer = -1;
+    g_expert_cache.cached_expert = -1;
+
+    bool expert_ok = g_expert_cache.gate_q && g_expert_cache.gate_s &&
+                     g_expert_cache.up_q && g_expert_cache.up_s &&
+                     g_expert_cache.down_q && g_expert_cache.down_s;
+#else
+    bool expert_ok = true;
+#endif
+
     return g_x && g_kbuf && g_vbuf && g_xnorm && g_qkv_out &&
            g_attn_out && g_proj_out && g_att && g_mlp_gate &&
-           g_mlp_up && g_mlp_hidden && g_mlp_out && g_logits;
+           g_mlp_up && g_mlp_hidden && g_mlp_out && g_logits && expert_ok;
 }
 
 void setup() {

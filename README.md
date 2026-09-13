@@ -18,17 +18,17 @@ The engine supports three target configurations tailored to microcontroller SRAM
 | Key/Value Attention Heads ($N_{kv\_head}$) | 2 (Grouped-Query Attention) | 1 (Multi-Query Attention) | 1 (Multi-Query Attention) |
 | Head Dimension ($HeadDim$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) | 32 ($N_{embd} / N_{head}$) |
 | MLP Hidden Dimension ($MLP_{hidden}$) | 256 | 192 | 64 |
-| Mixture-of-Experts ($N_{experts}$) | 28 experts per layer | 16 experts per layer | 32 experts per layer |
+| Mixture-of-Experts ($N_{experts}$) | 36 experts per layer | 16 experts per layer | 32 experts per layer |
 | Expert Routing Policy | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) | Top-1 Hard Routing ($K=1$) |
-| Context Window Capacity ($CTX$) | 192 tokens | 64 tokens | 28 tokens (trained on 32-token windows) |
+| Context Window Capacity ($CTX$) | 512 tokens | 64 tokens | 28 tokens (trained on 32-token windows) |
 | Vocabulary Dimension ($Vocab$) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) | 2,048 BPE tokens (shared tokenizer) |
-| Total Parameters | ~51.2 M | ~10.0 M | ~1.8 M |
-| Quantization Scheme | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales | 1.58-bit Ternary Weights / INT8 Activations, INT8 embeddings, FP16 scales |
-| Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
-| Memory Management | 1400 KB Arena in octal PSRAM | 160 KB Dynamic Arena (heap) | 40 KB Static BSS Buffer (Zero Heap) |
-| Static System RAM (measured) | ~19 KB | ~22 KB | ~70 KB (incl. 40 KB arena, 86% of 80 KB) |
-| Active Inference SRAM | ~1.2 MB (PSRAM) | ~150 KB (of 160 KB heap arena) | ~38.6 KB (of 40 KB static arena) |
-| Binary Flash Consumption | ~14.6 MB (91.8% of 15.9 MB app) | ~3.4 MB (83.8% of 3.9 MB app) | ~0.9 MB (89.4% of 1.0 MB irom) |
+| Total Parameters | ~65.4 M | ~10.0 M | ~1.8 M |
+| Quantization Scheme | Base-3 Radix 1.58-bit Ternary (5 weights/byte) / INT8 Activations, FP16 scales | Base-3 Radix 1.58-bit Ternary (5 weights/byte) / INT8 Activations, FP16 scales | Base-3 Radix 1.58-bit Ternary (5 weights/byte) / INT8 Activations, FP16 scales |
+| Weights Storage | SPI Flash (`PROGMEM`, 4-byte aligned) + PSRAM Cache | SPI Flash (`PROGMEM`, 4-byte aligned) | SPI Flash (`PROGMEM`, 4-byte aligned) |
+| Memory Management | 4096 KB Arena in octal PSRAM | 160 KB Dynamic Arena (heap) | 40 KB Static BSS Buffer (Zero Heap) |
+| Static System RAM (measured) | ~19 KB | ~22 KB | ~71.6 KB (incl. 40 KB arena, 87.5% of 80 KB) |
+| Active Inference SRAM | ~3.1 MB (PSRAM) | ~150 KB (of 160 KB heap arena) | ~38.6 KB (of 40 KB static arena) |
+| Binary Flash Consumption | ~15.6 MB (98.2% of 15.88 MB app) | ~2.7 MB (68% of 3.9 MB app) | ~0.71 MB (68.2% of 1.0 MB irom) |
 
 ---
 
@@ -264,12 +264,12 @@ python convert_model_to_c.py esp8266
   and a custom `partitions_s3_16MB.csv` layout (single ~15.9 MB app partition, no OTA, no
   spiffs/coredump — the firmware uses neither, so every byte goes to the model).
 * Export storage formats (all applied post-training in `convert_model_to_c.py`):
-  ternary 2-bit-packed weights, per-group **FP16** scales (firmware converts via `half_to_float`,
+  ternary Base-3 packed weights, per-group **FP16** scales (firmware converts via `half_to_float`,
   max error ~8e-4 vs FP32), per-token **INT8** embedding table + FP32 row scales
   (logit error ~5e-4 relative). Router, norms, and RoPE stay FP32.
-* The ~1.2 MB inference arena is allocated in PSRAM via `ps_malloc` (SRAM fallback attempted,
+* The ~4.0 MB inference arena is allocated in PSRAM via `ps_malloc` (SRAM fallback attempted,
   boot fails gracefully with `[FAIL]` if neither fits). Firmware prints PSRAM size at startup.
-* `INFER_CTX` (192) is compile-time checked against the trained `block_size`
+* `INFER_CTX` (512) is compile-time checked against the trained `block_size`
   (`static_assert` in `main.cpp`): always re-export weights after retraining.
 
 ---
@@ -301,14 +301,14 @@ line pairs (the exact shape `main.py`'s loader expects).
   answers, teaching paraphrase tolerance and response diversity instead of robotic repeats.
 * **Length discipline**: every pair is length-gated with the real BPE tokenizer
   (question ≤ 48, answer ≤ 84, pair ≤ 160 tokens; observed max 73), so nothing is ever
-  truncated by the 192-token training block and batches stay clean.
+  truncated by the 512-token training block and batches stay clean.
 * The legacy base pairs were persona-normalized by the generator
   (`trained by researchers` → `created by developers`) for a single consistent creator story.
 
 ### 7.2 Training
 
 ```bash
-python main.py --target=esp32s3 --train   # ~51 M-param S3 model (default 25k iters)
+python main.py --target=esp32s3 --train   # ~65 M-param S3 model (default 25k iters)
 python main.py --target=esp32 --train
 python main.py --target=esp8266 --train
 ```

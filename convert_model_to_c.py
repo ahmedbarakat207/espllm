@@ -168,6 +168,7 @@ def get_quantized(mod):
     if hasattr(mod, "qweight"):
         q = mod.qweight
         scale = mod.scale.float()
+        group_size = getattr(mod, "group_size", GROUP_SIZE)
     else:
         w = mod.weight
         group_size = getattr(mod, "group_size", GROUP_SIZE)
@@ -181,22 +182,33 @@ def get_quantized(mod):
         q = q.view(out, padded_n)[:, :n]
         scale = scale.squeeze(-1)
 
-    q_mapped = torch.where(
-        q == -1, torch.tensor(2, dtype=torch.uint8, device=q.device), q.to(torch.uint8)
-    )
-    out, n = q_mapped.shape
-    pad_len = (4 - (n % 4)) % 4
-    if pad_len > 0:
-        q_mapped = F.pad(q_mapped, (0, pad_len))
+    # 5 ternary weights per byte
+    out, n = q.shape
+    n_groups = math.ceil(n / group_size)
+    padded_n = n_groups * group_size
+    if padded_n != n:
+        q = F.pad(q, (0, padded_n - n))
 
+    q_groups = q.view(out, n_groups, group_size)
+    pad_g = (5 - (group_size % 5)) % 5
+    if pad_g > 0:
+        q_groups = F.pad(q_groups, (0, pad_g))
+
+    q_map = torch.where(
+        q_groups == -1,
+        torch.tensor(2, dtype=torch.uint8, device=q.device),
+        q_groups.to(torch.uint8),
+    )
+    m5 = q_map.view(out, n_groups, -1, 5)
     packed = (
-        (q_mapped[:, 0::4] & 0x03)
-        | ((q_mapped[:, 1::4] & 0x03) << 2)
-        | ((q_mapped[:, 2::4] & 0x03) << 4)
-        | ((q_mapped[:, 3::4] & 0x03) << 6)
-    )
-
-    return packed.to(torch.uint8), scale
+        m5[..., 0].to(torch.int32)
+        + m5[..., 1].to(torch.int32) * 3
+        + m5[..., 2].to(torch.int32) * 9
+        + m5[..., 3].to(torch.int32) * 27
+        + m5[..., 4].to(torch.int32) * 81
+    ).to(torch.uint8)
+    packed_flat = packed.view(out, -1)
+    return packed_flat, scale
 
 
 def emit_quantized(prefix, packed, scale):
@@ -306,6 +318,7 @@ static const uint8_t  model_group_size = {GROUP_SIZE};
 static const uint16_t model_mlp_hidden = {mlp_hidden};
 static const uint8_t  model_n_experts  = {n_experts};
 static const uint8_t  model_n_kv_head  = {n_kv_head};
+static const uint8_t  model_weights_per_byte = 5;
 """)
 sections.append(
     emit_u8(
